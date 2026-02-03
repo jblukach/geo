@@ -69,7 +69,7 @@ class GeoliteSearchUSW2(Stack):
         maxminddb = _lambda.LayerVersion(
             self, 'maxminddb',
             layer_version_name = 'maxminddb',
-            description = str(year)+'-'+str(month),
+            description = str(year)+'-'+str(month)+'-'+str(day)+' deployment',
             code = _lambda.Code.from_bucket(
                 bucket = bucket,
                 key = 'maxminddb.zip'
