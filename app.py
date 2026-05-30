@@ -3,59 +3,24 @@ import os
 
 import aws_cdk as cdk
 
-from geolite.geolite_download import GeoliteDownload
-from geolite.geolite_searchuse1 import GeoliteSearchUSE1
-from geolite.geolite_searchusw2 import GeoliteSearchUSW2
-from geolite.geolite_stack import GeoliteStack
+from geo.geo_stack import GeoStack
+
 
 app = cdk.App()
-
-GeoliteDownload(
-    app, 'GeoliteDownload',
-    env = cdk.Environment(
-        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
-        region = 'us-east-2'
+GeoStack(
+    app,
+    "GeoStack",
+    env=cdk.Environment(
+        account=os.getenv('CDK_DEFAULT_ACCOUNT'),
+        region='us-east-2'
     ),
-    synthesizer = cdk.DefaultStackSynthesizer(
-        qualifier = 'lukach'
+    synthesizer=cdk.DefaultStackSynthesizer(
+        qualifier='lukach'
     )
 )
 
-GeoliteSearchUSE1(
-    app, 'GeoliteSearchUSE1',
-    env = cdk.Environment(
-        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
-        region = 'us-east-1'
-    ),
-    synthesizer = cdk.DefaultStackSynthesizer(
-        qualifier = 'lukach'
-    )
-)
-
-GeoliteSearchUSW2(
-    app, 'GeoliteSearchUSW2',
-    env = cdk.Environment(
-        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
-        region = 'us-west-2'
-    ),
-    synthesizer = cdk.DefaultStackSynthesizer(
-        qualifier = 'lukach'
-    )
-)
-
-GeoliteStack(
-    app, 'GeoliteStack',
-    env = cdk.Environment(
-        account = os.getenv('CDK_DEFAULT_ACCOUNT'),
-        region = 'us-east-1'
-    ),
-    synthesizer = cdk.DefaultStackSynthesizer(
-        qualifier = 'lukach'
-    )
-)
-
-cdk.Tags.of(app).add('Alias','geolite')
-cdk.Tags.of(app).add('GitHub','https://github.com/jblukach/geolite')
-cdk.Tags.of(app).add('Org','lukach.io')
+cdk.Tags.of(app).add('Alias', 'geo')
+cdk.Tags.of(app).add('GitHub', 'https://github.com/jblukach/geo')
+cdk.Tags.of(app).add('Org', 'lukach.io')
 
 app.synth()

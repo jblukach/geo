@@ -5,10 +5,10 @@ from aws_cdk import (
 
 from constructs import Construct
 
-class GeoliteStack(Stack):
+class GeoOidc(Construct):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
-        super().__init__(scope, construct_id, **kwargs)
+        super().__init__(scope, construct_id)
 
         account = Stack.of(self).account
 
@@ -27,7 +27,7 @@ class GeoliteStack(Stack):
             assumed_by = _iam.WebIdentityPrincipal(provider.open_id_connect_provider_arn).with_conditions(
                 {
                     "StringLike": {
-                        "token.actions.githubusercontent.com:sub": "repo:jblukach/geolite:*"
+                        "token.actions.githubusercontent.com:sub": "repo:jblukach/geo:*"
                     }
                 }
             )
