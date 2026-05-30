@@ -202,7 +202,7 @@ class GeoDownload(Construct):
             ),
         )
 
-        dbip_event.add_target(_targets.LambdaFunction(dbip_download))
+        #dbip_event.add_target(_targets.LambdaFunction(dbip_download))
 
         ipinfo_event = _events.Rule(
             self,
@@ -216,7 +216,7 @@ class GeoDownload(Construct):
             ),
         )
 
-        ipinfo_event.add_target(_targets.LambdaFunction(ipinfo_download))
+        #ipinfo_event.add_target(_targets.LambdaFunction(ipinfo_download))
 
         ip2location_event = _events.Rule(
             self,
@@ -230,4 +230,4 @@ class GeoDownload(Construct):
             ),
         )
 
-        ip2location_event.add_target(_targets.LambdaFunction(ip2location_download))
+        #ip2location_event.add_target(_targets.LambdaFunction(ip2location_download))
