@@ -133,6 +133,25 @@ class GeoDownload(Construct):
             },
         )
 
+        ip2location_download = _lambda.Function(
+            self,
+            "ip2locationdownload",
+            function_name="ip2location-download",
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            architecture=_lambda.Architecture.ARM_64,
+            code=_lambda.Code.from_asset("download/ip2location"),
+            handler="ip2location.handler",
+            ephemeral_storage_size=Size.gibibytes(2),
+            timeout=Duration.seconds(900),
+            memory_size=2048,
+            role=role,
+            environment={
+                "SECRET_NAME": "credentials",
+                "IP2LOCATION_SECRET_KEY": "IP2LOCATION",
+                "DOWNLOAD_BUCKET_NAME": download_bucket.bucket_name,
+            },
+        )
+
         _logs.LogGroup(
             self,
             "dbipdownloadlogs",
@@ -145,6 +164,14 @@ class GeoDownload(Construct):
             self,
             "ipinfodownloadlogs",
             log_group_name="/aws/lambda/" + ipinfo_download.function_name,
+            retention=_logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        _logs.LogGroup(
+            self,
+            "ip2locationdownloadlogs",
+            log_group_name="/aws/lambda/" + ip2location_download.function_name,
             retention=_logs.RetentionDays.ONE_WEEK,
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -190,3 +217,17 @@ class GeoDownload(Construct):
         )
 
         ipinfo_event.add_target(_targets.LambdaFunction(ipinfo_download))
+
+        ip2location_event = _events.Rule(
+            self,
+            "ip2locationdownloadevent",
+            schedule=_events.Schedule.cron(
+                minute="0",
+                hour="12",
+                day="1",
+                month="*",
+                year="*",
+            ),
+        )
+
+        ip2location_event.add_target(_targets.LambdaFunction(ip2location_download))
