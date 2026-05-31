@@ -24,5 +24,18 @@ class GeoBucket(Construct):
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
             enforce_ssl=True,
+            event_bridge_enabled=True,
+            versioned=False,
+        )
+
+        self.processed_bucket = _s3.Bucket(
+            self,
+            'processed',
+            bucket_name=f'geo-processed-{region}-{account}',
+            encryption=_s3.BucketEncryption.S3_MANAGED,
+            block_public_access=_s3.BlockPublicAccess.BLOCK_ALL,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            enforce_ssl=True,
             versioned=False,
         )

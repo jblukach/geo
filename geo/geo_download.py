@@ -17,7 +17,7 @@ from constructs import Construct
 
 class GeoDownload(Construct):
 
-    def __init__(self, scope: Construct, construct_id: str, download_bucket: _s3.IBucket, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, download_bucket: _s3.IBucket, requests_layer: _lambda.ILayerVersion, **kwargs) -> None:
         super().__init__(scope, construct_id)
 
         _ssm.StringParameter(
@@ -81,6 +81,7 @@ class GeoDownload(Construct):
             timeout=Duration.seconds(900),
             memory_size=2048,
             role=role,
+            layers=[requests_layer],
             environment={
                 "SECRET_NAME": "credentials",
                 "DOWNLOAD_BUCKET_NAME": download_bucket.bucket_name,
@@ -109,6 +110,7 @@ class GeoDownload(Construct):
             timeout=Duration.seconds(900),
             memory_size=2048,
             role=role,
+            layers=[requests_layer],
             environment={
                 "DOWNLOAD_BUCKET_NAME": download_bucket.bucket_name,
             },
@@ -126,6 +128,7 @@ class GeoDownload(Construct):
             timeout=Duration.seconds(900),
             memory_size=2048,
             role=role,
+            layers=[requests_layer],
             environment={
                 "SECRET_NAME": "credentials",
                 "IPINFO_SECRET_KEY": "IPINFO",
@@ -145,6 +148,7 @@ class GeoDownload(Construct):
             timeout=Duration.seconds(900),
             memory_size=2048,
             role=role,
+            layers=[requests_layer],
             environment={
                 "SECRET_NAME": "credentials",
                 "IP2LOCATION_SECRET_KEY": "IP2LOCATION",
