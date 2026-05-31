@@ -26,3 +26,4 @@ class GeoStack(Stack):
         )
 
         self.download_bucket = bucket.download_bucket
+        self.processed_bucket = bucket.processed_bucket

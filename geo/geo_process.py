@@ -1,4 +1,4 @@
-from aws_cdk import Duration, RemovalPolicy, Stack
+from aws_cdk import Duration, RemovalPolicy, Size, Stack
 from aws_cdk import aws_events as _events
 from aws_cdk import aws_events_targets as _targets
 from aws_cdk import aws_lambda as _lambda
@@ -16,6 +16,7 @@ class GeoProcessStack(Stack):
         scope: Construct,
         construct_id: str,
         download_bucket: _s3.IBucket,
+        processed_bucket: _s3.IBucket,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -32,7 +33,7 @@ class GeoProcessStack(Stack):
             self,
             "processqueue",
             queue_name="geo-process",
-            visibility_timeout=Duration.minutes(6),
+            visibility_timeout=Duration.minutes(16),
             retention_period=Duration.days(4),
             dead_letter_queue=_sqs.DeadLetterQueue(
                 queue=dead_letter_queue,
@@ -49,10 +50,13 @@ class GeoProcessStack(Stack):
             architecture=_lambda.Architecture.ARM_64,
             code=_lambda.Code.from_asset("process"),
             handler="process.handler",
-            timeout=Duration.minutes(5),
-            memory_size=1024,
+            ephemeral_storage_size=Size.gibibytes(3),
+            timeout=Duration.seconds(900),
+            memory_size=3008,
             environment={
                 "DOWNLOAD_BUCKET_NAME": download_bucket.bucket_name,
+                "PROCESSED_BUCKET_NAME": processed_bucket.bucket_name,
+                "PROCESS_QUEUE_URL": process_queue.queue_url,
             },
         )
 
@@ -65,7 +69,9 @@ class GeoProcessStack(Stack):
         )
 
         download_bucket.grant_read(process)
+        processed_bucket.grant_put(process)
         process_queue.grant_consume_messages(process)
+        process_queue.grant_send_messages(process)
 
         process.add_event_source(
             _event_sources.SqsEventSource(
@@ -88,7 +94,9 @@ class GeoProcessStack(Stack):
                     "object": {
                         "key": [
                             "GeoLite2-ASN-Blocks-IPv4.csv",
+                            "GeoLite2-ASN-Blocks-IPv6.csv",
                             "GeoLite2-City-Blocks-IPv4.csv",
+                            "GeoLite2-City-Blocks-IPv6.csv",
                         ],
                     },
                 },
