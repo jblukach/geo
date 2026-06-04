@@ -15,85 +15,6 @@ def _write_csv(path, fieldnames, rows):
         writer.writerows(rows)
 
 
-class CombineIntervalsTests(unittest.TestCase):
-
-    def test_splits_city_rows_and_adds_asn_only_gaps(self):
-        city_intervals = [
-            {
-                "start": 0,
-                "end": 7,
-                "continent_code": "NA",
-                "country_iso_code": "US",
-                "subdivision": "Ohio",
-                "city": "Columbus",
-            }
-        ]
-        asn_intervals = [
-            {
-                "start": 0,
-                "end": 3,
-                "asn": "64500",
-                "organization": "Example A",
-            },
-            {
-                "start": 8,
-                "end": 15,
-                "asn": "64501",
-                "organization": "Example B",
-            },
-        ]
-
-        rows = process.combine_intervals(city_intervals, asn_intervals, 4)
-
-        self.assertEqual(
-            rows,
-            [
-                {
-                    "startip": "0",
-                    "endip": "3",
-                    "network": "0.0.0.0/30",
-                    "asn": "64500",
-                    "organization": "Example A",
-                    "continent_code": "NA",
-                    "country_iso_code": "US",
-                    "subdivision": "Ohio",
-                    "city": "Columbus",
-                },
-                {
-                    "startip": "4",
-                    "endip": "7",
-                    "network": "0.0.0.4/30",
-                    "asn": "",
-                    "organization": "",
-                    "continent_code": "NA",
-                    "country_iso_code": "US",
-                    "subdivision": "Ohio",
-                    "city": "Columbus",
-                },
-                {
-                    "startip": "8",
-                    "endip": "15",
-                    "network": "0.0.0.8/29",
-                    "asn": "64501",
-                    "organization": "Example B",
-                    "continent_code": "",
-                    "country_iso_code": "",
-                    "subdivision": "",
-                    "city": "",
-                },
-            ],
-        )
-
-    def test_ipv6_rows_include_integer_start_and_end_ip(self):
-        start_ip = (123 << process.IPV6_SCORE_BITS) + process.IPV6_SCORE_MASK
-        end_ip = start_ip + 2
-
-        rows = process._segment_to_rows(start_ip, end_ip, 6, None, None)
-
-        self.assertEqual([row["startip"] for row in rows], [str(start_ip), str(start_ip + 1)])
-        self.assertEqual([row["endip"] for row in rows], [str(start_ip), str(end_ip)])
-
-
 class BuildOutputsTests(unittest.TestCase):
 
     def test_uses_registered_country_geoname_when_geoname_missing(self):
@@ -188,20 +109,33 @@ class BuildOutputsTests(unittest.TestCase):
 
             outputs = process.build_outputs_from_directory(directory)
 
-        ipv4_lines = outputs["GeoLite2-IPv4.txt"].strip().splitlines()
-        ipv6_lines = outputs["GeoLite2-IPv6.txt"].strip().splitlines()
+        asn_ipv4_lines = outputs["GeoLite2-ASN-Blocks-IPv4.txt"].strip().splitlines()
+        asn_ipv6_lines = outputs["GeoLite2-ASN-Blocks-IPv6.txt"].strip().splitlines()
+        city_ipv4_lines = outputs["GeoLite2-City-Blocks-IPv4.txt"].strip().splitlines()
+        city_ipv6_lines = outputs["GeoLite2-City-Blocks-IPv6.txt"].strip().splitlines()
 
         self.assertEqual(
-            ipv4_lines,
+            asn_ipv4_lines,
             [
-                "16777216|16777217|1.0.0.0/31|13335|Cloudflare|NA|US|Ohio|Columbus"
+                "16777216|16777217|1.0.0.0/31|13335|Cloudflare"
             ],
         )
         self.assertEqual(
-            ipv6_lines,
+            asn_ipv6_lines,
             [
-                "42540766411282592856903984951653826560|42540766411282592856903984951653826561|2001:db8::/127|64510|Example IPv6|EU|DE||Berlin",
-                "42540766411282592856903984951653826562|42540766411282592856903984951653826563|2001:db8::2/127|64510|Example IPv6||||",
+                "42540766411282592856903984951653826560|42540766411282592856903984951653826563|2001:db8::/126|64510|Example IPv6",
+            ],
+        )
+        self.assertEqual(
+            city_ipv4_lines,
+            [
+                "16777216|16777217|1.0.0.0/31|NA|US|Ohio|Columbus"
+            ],
+        )
+        self.assertEqual(
+            city_ipv6_lines,
+            [
+                "42540766411282592856903984951653826560|42540766411282592856903984951653826561|2001:db8::/127|EU|DE||Berlin",
             ],
         )
 
@@ -265,20 +199,10 @@ class BuildOutputsTests(unittest.TestCase):
 
             artifacts = process.build_output_artifacts(directory)
 
-        ipv4_summary = artifacts["GeoLite2-IPv4.txt"]["summary"]
-        ipv6_summary = artifacts["GeoLite2-IPv6.txt"]["summary"]
-
-        self.assertTrue(ipv4_summary["cityCoverageComplete"])
-        self.assertTrue(ipv4_summary["asnCoverageComplete"])
-        self.assertTrue(ipv4_summary["unionCoverageComplete"])
-        self.assertEqual(ipv4_summary["outputRows"], 1)
-        self.assertEqual(ipv4_summary["outputAddresses"], 2)
-
-        self.assertTrue(ipv6_summary["cityCoverageComplete"])
-        self.assertTrue(ipv6_summary["asnCoverageComplete"])
-        self.assertTrue(ipv6_summary["unionCoverageComplete"])
-        self.assertEqual(ipv6_summary["outputRows"], 1)
-        self.assertEqual(ipv6_summary["outputAddresses"], 2)
+        self.assertEqual(artifacts["GeoLite2-ASN-Blocks-IPv4.txt"]["summary"]["outputRows"], 1)
+        self.assertEqual(artifacts["GeoLite2-ASN-Blocks-IPv6.txt"]["summary"]["outputRows"], 1)
+        self.assertEqual(artifacts["GeoLite2-City-Blocks-IPv4.txt"]["summary"]["outputRows"], 1)
+        self.assertEqual(artifacts["GeoLite2-City-Blocks-IPv6.txt"]["summary"]["outputRows"], 1)
 
 
 class HandlerTests(unittest.TestCase):
@@ -286,7 +210,7 @@ class HandlerTests(unittest.TestCase):
     def setUp(self):
         process.reset_runtime_state()
 
-    def test_handler_enqueues_family_jobs(self):
+    def test_handler_enqueues_source_jobs(self):
         queued_messages = []
 
         class FakeS3Client:
@@ -330,24 +254,24 @@ class HandlerTests(unittest.TestCase):
 
         self.assertEqual(response["statusCode"], 200)
         self.assertTrue(response["skipped"])
-        self.assertEqual(response["skipReason"], "queued_family_jobs")
-        self.assertEqual(response["queuedFamilies"], [4])
-        self.assertEqual(response["impactedFamilies"], [4])
+        self.assertEqual(response["skipReason"], "queued_source_jobs")
+        self.assertEqual(response["queuedSourceKeys"], ["GeoLite2-ASN-Blocks-IPv4.csv"])
+        self.assertEqual(response["impactedSourceKeys"], ["GeoLite2-ASN-Blocks-IPv4.csv"])
         self.assertEqual(
             queued_messages,
             [
                 (
                     "https://example.com/queue",
                     {
-                        "family": 4,
-                        "jobType": "family_build",
+                        "sourceKey": "GeoLite2-ASN-Blocks-IPv4.csv",
+                        "jobType": "source_build",
                         "sourceSignature": mock.ANY,
                     },
                 ),
             ],
         )
 
-    def test_handler_enqueues_ipv6_family_for_prefixed_key(self):
+    def test_handler_enqueues_ipv6_source_for_prefixed_key(self):
         queued_messages = []
 
         class FakeS3Client:
@@ -391,24 +315,24 @@ class HandlerTests(unittest.TestCase):
 
         self.assertEqual(response["statusCode"], 200)
         self.assertTrue(response["skipped"])
-        self.assertEqual(response["skipReason"], "queued_family_jobs")
-        self.assertEqual(response["queuedFamilies"], [6])
-        self.assertEqual(response["impactedFamilies"], [6])
+        self.assertEqual(response["skipReason"], "queued_source_jobs")
+        self.assertEqual(response["queuedSourceKeys"], ["GeoLite2-ASN-Blocks-IPv6.csv"])
+        self.assertEqual(response["impactedSourceKeys"], ["GeoLite2-ASN-Blocks-IPv6.csv"])
         self.assertEqual(
             queued_messages,
             [
                 (
                     "https://example.com/queue",
                     {
-                        "family": 6,
-                        "jobType": "family_build",
+                        "sourceKey": "GeoLite2-ASN-Blocks-IPv6.csv",
+                        "jobType": "source_build",
                         "sourceSignature": mock.ANY,
                     },
                 ),
             ],
         )
 
-    def test_handler_worker_job_uploads_single_family_output(self):
+    def test_handler_worker_job_uploads_single_source_output(self):
         source_files = {
             "GeoLite2-City-Locations-en.csv": "geoname_id,continent_name,country_name,subdivision_1_name,city_name,time_zone\n1,North America,United States,Ohio,Columbus,America/New_York\n",
             "GeoLite2-City-Blocks-IPv4.csv": "network,geoname_id,registered_country_geoname_id\n1.0.0.0/31,1,\n",
@@ -417,6 +341,7 @@ class HandlerTests(unittest.TestCase):
             "GeoLite2-ASN-Blocks-IPv6.csv": "network,autonomous_system_number,autonomous_system_organization\n2001:db8::/127,64510,Example IPv6\n",
         }
         uploaded = {}
+        uploaded_parts = []
 
         class FakeS3Client:
 
@@ -428,15 +353,30 @@ class HandlerTests(unittest.TestCase):
                 with open(filename, "w", encoding="utf-8") as handle:
                     handle.write(source_files[key])
 
-            def upload_file(self, Filename, Bucket, Key, ExtraArgs=None):
-                del ExtraArgs
-                with open(Filename, "r", encoding="utf-8") as handle:
-                    uploaded[(Bucket, Key)] = handle.read()
+            def create_multipart_upload(self, Bucket, Key, ContentType):
+                del ContentType
+                del Bucket, Key
+                uploaded_parts.clear()
+                return {"UploadId": "upload-id"}
+
+            def upload_part(self, Bucket, Key, PartNumber, UploadId, Body):
+                del Bucket, Key, PartNumber, UploadId
+                Body.seek(0)
+                uploaded_parts.append(Body.read().decode("utf-8"))
+                return {"ETag": '"etag"'}
+
+            def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload):
+                del UploadId, MultipartUpload
+                uploaded[(Bucket, Key)] = "".join(uploaded_parts)
+
+            def abort_multipart_upload(self, Bucket, Key, UploadId):
+                del Bucket, Key, UploadId
+                raise AssertionError("abort_multipart_upload should not be called")
 
         event = {
             "Records": [
                 {
-                    "body": '{"jobType":"family_build","family":4}'
+                    "body": '{"jobType":"source_build","sourceKey":"GeoLite2-ASN-Blocks-IPv4.csv"}'
                 }
             ]
         }
@@ -462,9 +402,9 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(response["mode"], "worker")
         self.assertEqual(
             sorted(uploaded.keys()),
-            [("processed-bucket", "GeoLite2-IPv4.txt")],
+            [("processed-bucket", "GeoLite2-ASN-Blocks-IPv4.txt")],
         )
-        self.assertIn("1.0.0.0/31|13335|Cloudflare", uploaded[("processed-bucket", "GeoLite2-IPv4.txt")])
+        self.assertIn("16777216|16777217|1.0.0.0/31|13335|Cloudflare", uploaded[("processed-bucket", "GeoLite2-ASN-Blocks-IPv4.txt")])
 
     def test_handler_skips_rebuild_until_all_source_files_exist(self):
         uploaded = {}
@@ -494,7 +434,7 @@ class HandlerTests(unittest.TestCase):
         event = {
             "Records": [
                 {
-                    "body": '{"detail":{"bucket":{"name":"download-bucket"},"object":{"key":"GeoLite2-ASN-Blocks-IPv4.csv"}}}'
+                    "body": '{"detail":{"bucket":{"name":"download-bucket"},"object":{"key":"GeoLite2-City-Blocks-IPv4.csv"}}}'
                 }
             ]
         }
@@ -622,8 +562,8 @@ class HandlerTests(unittest.TestCase):
                 second_response = process.handler(event, None)
 
         self.assertTrue(first_response["skipped"])
-        self.assertEqual(first_response["skipReason"], "queued_family_jobs")
-        self.assertEqual(first_response["queuedFamilies"], [4])
+        self.assertEqual(first_response["skipReason"], "queued_source_jobs")
+        self.assertEqual(first_response["queuedSourceKeys"], ["GeoLite2-ASN-Blocks-IPv4.csv"])
         self.assertTrue(second_response["skipped"])
         self.assertEqual(second_response["skipReason"], "source_unchanged")
         self.assertEqual(
