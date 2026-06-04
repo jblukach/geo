@@ -24,3 +24,12 @@ class GeoSecret(Construct):
                 'MOMENTO': SecretValue.unsafe_plain_text(''),
             }
         )
+
+        _secrets.Secret(
+            self,
+            'readonly',
+            secret_name='readonly',
+            secret_object_value={
+                'MOMENTO': SecretValue.unsafe_plain_text(''),
+            }
+        )
