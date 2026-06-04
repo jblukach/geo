@@ -1,4 +1,5 @@
 import csv
+import io
 import ipaddress
 import json
 import os
@@ -6,6 +7,8 @@ import tempfile
 import time
 import urllib.parse
 from typing import Any
+
+_S3_MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB (S3 minimum part size is 5 MB)
 
 
 SOURCE_FILES = {
@@ -1074,20 +1077,28 @@ def _process_family_job(
         asn_scan = _scan_interval_source_file(asn_path)
         union_addresses = _count_union_addresses_from_sources(city_path, asn_path)
 
-        output_path = os.path.join(directory, output_key)
         output_rows = 0
         output_addresses = 0
         geo_addresses = 0
         asn_output_addresses = 0
 
-        with open(output_path, "w", encoding="utf-8", newline="") as output_handle:
+        mpu = s3_client.create_multipart_upload(
+            Bucket=processed_bucket_name,
+            Key=output_key,
+            ContentType="text/plain",
+        )
+        upload_id = mpu["UploadId"]
+        parts = []
+        part_number = 1
+        buffer = io.BytesIO()
+        try:
             for row in _iter_combined_rows(
                 _iter_city_intervals(city_path, locations),
                 _iter_asn_intervals(asn_path),
                 family,
             ):
-                output_handle.write("|".join(row[field] for field in OUTPUT_FIELDS))
-                output_handle.write("\n")
+                line = "|".join(row[field] for field in OUTPUT_FIELDS) + "\n"
+                buffer.write(line.encode("utf-8"))
 
                 row_addresses = int(row["endip"]) - int(row["startip"]) + 1
                 output_rows += 1
@@ -1096,6 +1107,56 @@ def _process_family_job(
                     geo_addresses += row_addresses
                 if row["asn"]:
                     asn_output_addresses += row_addresses
+
+                if buffer.tell() >= _S3_MULTIPART_CHUNK_SIZE:
+                    buffer.seek(0)
+                    response = s3_client.upload_part(
+                        Bucket=processed_bucket_name,
+                        Key=output_key,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=buffer,
+                    )
+                    parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+                    part_number += 1
+                    buffer = io.BytesIO()
+
+            remaining = buffer.tell()
+            if remaining > 0:
+                buffer.seek(0)
+                response = s3_client.upload_part(
+                    Bucket=processed_bucket_name,
+                    Key=output_key,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=buffer,
+                )
+                parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+            elif not parts:
+                # Empty output — upload an empty part to satisfy multipart requirements
+                buffer.seek(0)
+                response = s3_client.upload_part(
+                    Bucket=processed_bucket_name,
+                    Key=output_key,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=buffer,
+                )
+                parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+
+            s3_client.complete_multipart_upload(
+                Bucket=processed_bucket_name,
+                Key=output_key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+        except Exception:
+            s3_client.abort_multipart_upload(
+                Bucket=processed_bucket_name,
+                Key=output_key,
+                UploadId=upload_id,
+            )
+            raise
 
         summary = _build_output_summary_from_counts(
             output_key=output_key,
@@ -1110,13 +1171,6 @@ def _process_family_job(
                 "geoAddresses": geo_addresses,
                 "asnOutputAddresses": asn_output_addresses,
             },
-        )
-
-        s3_client.upload_file(
-            output_path,
-            processed_bucket_name,
-            output_key,
-            ExtraArgs={"ContentType": "text/plain"},
         )
         print(json.dumps(summary, sort_keys=True))
 
