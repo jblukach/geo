@@ -31,12 +31,14 @@ OUTPUT_FIELDS = (
     "network",
     "asn",
     "organization",
-    "continent",
-    "country",
+    "continent_code",
+    "country_iso_code",
     "subdivision",
     "city",
-    "timezone",
 )
+
+IPV6_SCORE_BITS = 53
+IPV6_SCORE_MASK = (1 << IPV6_SCORE_BITS) - 1
 
 FAMILY_CONFIG = {
     4: {
@@ -96,11 +98,10 @@ def _load_locations(file_path: str) -> dict[str, dict[str, str]]:
 
         index = {name: position for position, name in enumerate(header)}
         geoname_index = index.get("geoname_id")
-        continent_index = index.get("continent_name")
-        country_index = index.get("country_name")
+        continent_code_index = index.get("continent_code")
+        country_iso_code_index = index.get("country_iso_code")
         subdivision_index = index.get("subdivision_1_name")
         city_index = index.get("city_name")
-        timezone_index = index.get("time_zone")
 
         if geoname_index is None:
             return locations
@@ -113,22 +114,121 @@ def _load_locations(file_path: str) -> dict[str, dict[str, str]]:
             if not geoname_id:
                 continue
 
-            locations[geoname_id] = {
-                "continent": row[continent_index].strip()
-                if continent_index is not None and continent_index < len(row)
-                else "",
-                "country": row[country_index].strip()
-                if country_index is not None and country_index < len(row)
-                else "",
-                "subdivision": row[subdivision_index].strip()
+            subdivision = (
+                row[subdivision_index].strip()
                 if subdivision_index is not None and subdivision_index < len(row)
-                else "",
-                "city": row[city_index].strip()
+                else ""
+            )
+            city = (
+                row[city_index].strip()
                 if city_index is not None and city_index < len(row)
+                else ""
+            )
+
+            if subdivision and city and subdivision == city:
+                subdivision = ""
+
+            locations[geoname_id] = {
+                "continent_code": row[continent_code_index].strip()
+                if continent_code_index is not None and continent_code_index < len(row)
                 else "",
-                "timezone": row[timezone_index].strip()
-                if timezone_index is not None and timezone_index < len(row)
+                "country_iso_code": row[country_iso_code_index].strip()
+                if country_iso_code_index is not None
+                and country_iso_code_index < len(row)
                 else "",
+                "subdivision": subdivision,
+                "city": city,
+            }
+
+    return locations
+
+
+def _collect_city_geoname_ids(file_path: str) -> set[str]:
+    geoname_ids: set[str] = set()
+
+    with open(file_path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if not header:
+            return geoname_ids
+
+        index = {name: position for position, name in enumerate(header)}
+        geoname_index = index.get("geoname_id")
+        registered_index = index.get("registered_country_geoname_id")
+
+        for row in reader:
+            geoname_value = ""
+            if geoname_index is not None and geoname_index < len(row):
+                geoname_value = row[geoname_index].strip()
+
+            registered_value = ""
+            if registered_index is not None and registered_index < len(row):
+                registered_value = row[registered_index].strip()
+
+            geoname_id = geoname_value or registered_value
+            if geoname_id:
+                geoname_ids.add(geoname_id)
+
+    return geoname_ids
+
+
+def _load_locations_subset(
+    file_path: str,
+    geoname_ids: set[str],
+) -> dict[str, dict[str, str]]:
+    if not geoname_ids:
+        return {}
+
+    locations = {}
+
+    with open(file_path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if not header:
+            return locations
+
+        index = {name: position for position, name in enumerate(header)}
+        geoname_index = index.get("geoname_id")
+        continent_code_index = index.get("continent_code")
+        country_iso_code_index = index.get("country_iso_code")
+        subdivision_index = index.get("subdivision_1_name")
+        city_index = index.get("city_name")
+
+        if geoname_index is None:
+            return locations
+
+        for row in reader:
+            if geoname_index >= len(row):
+                continue
+
+            geoname_id = row[geoname_index].strip()
+            if not geoname_id or geoname_id not in geoname_ids:
+                continue
+
+            subdivision = (
+                row[subdivision_index].strip()
+                if subdivision_index is not None and subdivision_index < len(row)
+                else ""
+            )
+            city = (
+                row[city_index].strip()
+                if city_index is not None and city_index < len(row)
+                else ""
+            )
+
+            if subdivision and city and subdivision == city:
+                subdivision = ""
+
+            locations[geoname_id] = {
+                "continent_code": row[continent_code_index].strip()
+                if continent_code_index is not None and continent_code_index < len(row)
+                else "",
+                "country_iso_code": row[country_iso_code_index].strip()
+                if country_iso_code_index is not None
+                and country_iso_code_index < len(row)
+                else "",
+                "subdivision": subdivision,
+                "city": city,
             }
 
     return locations
@@ -184,11 +284,10 @@ def _read_city_intervals(
                 {
                     "start": start_ip,
                     "end": end_ip,
-                    "continent": location.get("continent", ""),
-                    "country": location.get("country", ""),
+                    "continent_code": location.get("continent_code", ""),
+                    "country_iso_code": location.get("country_iso_code", ""),
                     "subdivision": location.get("subdivision", ""),
                     "city": location.get("city", ""),
-                    "timezone": location.get("timezone", ""),
                 }
             )
 
@@ -251,13 +350,101 @@ def _read_asn_intervals(file_path: str) -> list[dict[str, object]]:
     return intervals
 
 
-def _next_interval(
-    intervals: list[dict[str, object]],
-    index: int,
-) -> tuple[dict[str, object] | None, int]:
-    if index >= len(intervals):
-        return None, index
-    return dict(intervals[index]), index + 1
+def _iter_city_intervals(
+    file_path: str,
+    locations: dict[str, dict[str, str]],
+):
+    with open(file_path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if not header:
+            return
+
+        index = {name: position for position, name in enumerate(header)}
+        network_index = index.get("network")
+        geoname_index = index.get("geoname_id")
+        registered_index = index.get("registered_country_geoname_id")
+
+        if network_index is None:
+            return
+
+        for row in reader:
+            if network_index >= len(row):
+                continue
+
+            network = row[network_index].strip()
+            if not network:
+                continue
+
+            start_ip, end_ip = _interval_from_network(network)
+
+            geoname_value = ""
+            if geoname_index is not None and geoname_index < len(row):
+                geoname_value = row[geoname_index].strip()
+
+            registered_value = ""
+            if registered_index is not None and registered_index < len(row):
+                registered_value = row[registered_index].strip()
+
+            geoname_id = geoname_value or registered_value
+            location = locations.get(geoname_id, {})
+
+            yield {
+                "start": start_ip,
+                "end": end_ip,
+                "continent_code": location.get("continent_code", ""),
+                "country_iso_code": location.get("country_iso_code", ""),
+                "subdivision": location.get("subdivision", ""),
+                "city": location.get("city", ""),
+            }
+
+
+def _iter_asn_intervals(file_path: str):
+    with open(file_path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if not header:
+            return
+
+        index = {name: position for position, name in enumerate(header)}
+        network_index = index.get("network")
+        asn_index = index.get("autonomous_system_number")
+        organization_index = index.get("autonomous_system_organization")
+
+        if network_index is None:
+            return
+
+        for row in reader:
+            if network_index >= len(row):
+                continue
+
+            network = row[network_index].strip()
+            if not network:
+                continue
+
+            start_ip, end_ip = _interval_from_network(network)
+
+            asn_value = ""
+            if asn_index is not None and asn_index < len(row):
+                asn_value = row[asn_index].strip()
+
+            organization_value = ""
+            if organization_index is not None and organization_index < len(row):
+                organization_value = row[organization_index].strip()
+
+            yield {
+                "start": start_ip,
+                "end": end_ip,
+                "asn": asn_value,
+                "organization": organization_value,
+            }
+
+
+def _next_interval(interval_iterator) -> dict[str, object] | None:
+    try:
+        return next(interval_iterator)
+    except StopIteration:
+        return None
 
 
 def _segment_to_rows(
@@ -288,53 +475,72 @@ def _iter_segment_rows(
     if start_ip > end_ip:
         return
 
-    start_address = ipaddress.ip_address(start_ip)
-    end_address = ipaddress.ip_address(end_ip)
+    def iter_segments():
+        if version == 4:
+            yield start_ip, end_ip
+            return
 
-    for network in ipaddress.summarize_address_range(start_address, end_address):
-        if network.version != version:
-            continue
+        current_start = start_ip
+        while current_start <= end_ip:
+            bucket = current_start >> IPV6_SCORE_BITS
+            bucket_end = ((bucket + 1) << IPV6_SCORE_BITS) - 1
+            current_end = min(end_ip, bucket_end)
+            yield current_start, current_end
+            current_start = current_end + 1
 
-        row = _blank_output_row()
-        row.update(
-            {
-                "startip": str(int(network.network_address)),
-                "endip": str(int(network.broadcast_address)),
-                "network": str(network),
-            }
-        )
+    for segment_start_ip, segment_end_ip in iter_segments():
+        segment_start_address = ipaddress.ip_address(segment_start_ip)
+        segment_end_address = ipaddress.ip_address(segment_end_ip)
 
-        if city_data is not None:
+        for network in ipaddress.summarize_address_range(
+            segment_start_address,
+            segment_end_address,
+        ):
+            if network.version != version:
+                continue
+
+            network_start = int(network.network_address)
+            network_end = int(network.broadcast_address)
+
+            row = _blank_output_row()
             row.update(
                 {
-                    "continent": str(city_data.get("continent", "")),
-                    "country": str(city_data.get("country", "")),
-                    "subdivision": str(city_data.get("subdivision", "")),
-                    "city": str(city_data.get("city", "")),
-                    "timezone": str(city_data.get("timezone", "")),
+                    "startip": str(network_start),
+                    "endip": str(network_end),
+                    "network": str(network),
                 }
             )
 
-        if asn_data is not None:
-            row.update(
-                {
-                    "asn": str(asn_data.get("asn", "")),
-                    "organization": str(asn_data.get("organization", "")),
-                }
-            )
+            if city_data is not None:
+                row.update(
+                    {
+                        "continent_code": str(city_data.get("continent_code", "")),
+                        "country_iso_code": str(city_data.get("country_iso_code", "")),
+                        "subdivision": str(city_data.get("subdivision", "")),
+                        "city": str(city_data.get("city", "")),
+                    }
+                )
 
-        yield row
+            if asn_data is not None:
+                row.update(
+                    {
+                        "asn": str(asn_data.get("asn", "")),
+                        "organization": str(asn_data.get("organization", "")),
+                    }
+                )
+
+            yield row
 
 
 def _iter_combined_rows(
-    city_intervals: list[dict[str, object]],
-    asn_intervals: list[dict[str, object]],
+    city_intervals,
+    asn_intervals,
     version: int,
 ):
-    city_index = 0
-    asn_index = 0
-    current_city, city_index = _next_interval(city_intervals, city_index)
-    current_asn, asn_index = _next_interval(asn_intervals, asn_index)
+    city_iterator = iter(city_intervals)
+    asn_iterator = iter(asn_intervals)
+    current_city = _next_interval(city_iterator)
+    current_asn = _next_interval(asn_iterator)
 
     while current_city is not None or current_asn is not None:
         if current_city is None:
@@ -345,7 +551,7 @@ def _iter_combined_rows(
                 None,
                 current_asn,
             )
-            current_asn, asn_index = _next_interval(asn_intervals, asn_index)
+            current_asn = _next_interval(asn_iterator)
             continue
 
         if current_asn is None:
@@ -356,7 +562,7 @@ def _iter_combined_rows(
                 current_city,
                 None,
             )
-            current_city, city_index = _next_interval(city_intervals, city_index)
+            current_city = _next_interval(city_iterator)
             continue
 
         city_start = int(current_city["start"])
@@ -366,12 +572,12 @@ def _iter_combined_rows(
 
         if city_end < asn_start:
             yield from _iter_segment_rows(city_start, city_end, version, current_city, None)
-            current_city, city_index = _next_interval(city_intervals, city_index)
+            current_city = _next_interval(city_iterator)
             continue
 
         if asn_end < city_start:
             yield from _iter_segment_rows(asn_start, asn_end, version, None, current_asn)
-            current_asn, asn_index = _next_interval(asn_intervals, asn_index)
+            current_asn = _next_interval(asn_iterator)
             continue
 
         if city_start < asn_start:
@@ -406,12 +612,12 @@ def _iter_combined_rows(
         )
 
         if city_end == overlap_end:
-            current_city, city_index = _next_interval(city_intervals, city_index)
+            current_city = _next_interval(city_iterator)
         else:
             current_city["start"] = overlap_end + 1
 
         if asn_end == overlap_end:
-            current_asn, asn_index = _next_interval(asn_intervals, asn_index)
+            current_asn = _next_interval(asn_iterator)
         else:
             current_asn["start"] = overlap_end + 1
 
@@ -439,7 +645,7 @@ def _render_output_with_stats(rows: list[dict[str, str]]) -> tuple[str, dict[str
         lines.append("|".join(row[field] for field in OUTPUT_FIELDS))
         row_addresses = int(row["endip"]) - int(row["startip"]) + 1
         output_addresses += row_addresses
-        if row["country"]:
+        if row["country_iso_code"]:
             geo_addresses += row_addresses
         if row["asn"]:
             asn_output_addresses += row_addresses
@@ -481,15 +687,94 @@ def _count_union_addresses(*interval_groups: list[dict[str, object]]) -> int:
     return total + (current_end - current_start + 1)
 
 
-def _build_output_summary(
+def _scan_interval_source_file(file_path: str) -> dict[str, int]:
+    rows = 0
+    addresses = 0
+
+    with open(file_path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if not header:
+            return {"rows": 0, "addresses": 0}
+
+        index = {name: position for position, name in enumerate(header)}
+        network_index = index.get("network")
+        if network_index is None:
+            return {"rows": 0, "addresses": 0}
+
+        for row in reader:
+            if network_index >= len(row):
+                continue
+
+            network = row[network_index].strip()
+            if not network:
+                continue
+
+            start_ip, end_ip = _interval_from_network(network)
+            rows += 1
+            addresses += end_ip - start_ip + 1
+
+    return {
+        "rows": rows,
+        "addresses": addresses,
+    }
+
+
+def _count_union_addresses_from_sources(city_path: str, asn_path: str) -> int:
+    city_iterator = _iter_city_intervals(city_path, {})
+    asn_iterator = _iter_asn_intervals(asn_path)
+    current_city = _next_interval(city_iterator)
+    current_asn = _next_interval(asn_iterator)
+
+    total = 0
+    current_start = 0
+    current_end = -1
+
+    while current_city is not None or current_asn is not None:
+        if current_asn is None:
+            next_interval = current_city
+            current_city = _next_interval(city_iterator)
+        elif current_city is None:
+            next_interval = current_asn
+            current_asn = _next_interval(asn_iterator)
+        elif int(current_city["start"]) <= int(current_asn["start"]):
+            next_interval = current_city
+            current_city = _next_interval(city_iterator)
+        else:
+            next_interval = current_asn
+            current_asn = _next_interval(asn_iterator)
+
+        start_ip = int(next_interval["start"])
+        end_ip = int(next_interval["end"])
+
+        if current_end < current_start:
+            current_start = start_ip
+            current_end = end_ip
+            continue
+
+        if start_ip <= current_end + 1:
+            current_end = max(current_end, end_ip)
+            continue
+
+        total += current_end - current_start + 1
+        current_start = start_ip
+        current_end = end_ip
+
+    if current_end >= current_start:
+        total += current_end - current_start + 1
+
+    return total
+
+
+def _build_output_summary_from_counts(
     output_key: str,
-    city_intervals: list[dict[str, object]],
-    asn_intervals: list[dict[str, object]],
+    source_city_rows: int,
+    source_asn_rows: int,
+    city_addresses: int,
+    asn_addresses: int,
+    union_addresses: int,
     stats: dict[str, int],
 ) -> dict[str, object]:
-    city_addresses = _count_addresses(city_intervals)
-    asn_addresses = _count_addresses(asn_intervals)
-    union_addresses = _count_union_addresses(city_intervals, asn_intervals)
     output_addresses = stats["outputAddresses"]
     geo_addresses = stats["geoAddresses"]
     asn_output_addresses = stats["asnOutputAddresses"]
@@ -497,8 +782,8 @@ def _build_output_summary(
     return {
         "event": "processed_output_summary",
         "output": output_key,
-        "sourceCityRows": len(city_intervals),
-        "sourceAsnRows": len(asn_intervals),
+        "sourceCityRows": source_city_rows,
+        "sourceAsnRows": source_asn_rows,
         "outputRows": stats["outputRows"],
         "cityAddresses": city_addresses,
         "asnAddresses": asn_addresses,
@@ -510,6 +795,23 @@ def _build_output_summary(
         "asnCoverageComplete": asn_output_addresses == asn_addresses,
         "unionCoverageComplete": output_addresses == union_addresses,
     }
+
+
+def _build_output_summary(
+    output_key: str,
+    city_intervals: list[dict[str, object]],
+    asn_intervals: list[dict[str, object]],
+    stats: dict[str, int],
+) -> dict[str, object]:
+    return _build_output_summary_from_counts(
+        output_key=output_key,
+        source_city_rows=len(city_intervals),
+        source_asn_rows=len(asn_intervals),
+        city_addresses=_count_addresses(city_intervals),
+        asn_addresses=_count_addresses(asn_intervals),
+        union_addresses=_count_union_addresses(city_intervals, asn_intervals),
+        stats=stats,
+    )
 
 
 def build_output_artifacts(directory: str) -> dict[str, dict[str, object]]:
@@ -695,7 +997,12 @@ def _extract_relevant_records(event) -> list[dict[str, str]]:
                 }
             )
 
-    return [record for record in records if record["key"] in TRIGGER_SOURCE_FILES]
+    def trigger_key(key: str) -> str:
+        return key.rsplit("/", 1)[-1]
+
+    return [
+        record for record in records if trigger_key(record["key"]) in TRIGGER_SOURCE_FILES
+    ]
 
 
 def _extract_family_jobs(event) -> list[dict[str, Any]]:
@@ -758,12 +1065,14 @@ def _process_family_job(
         )
         config = FAMILY_CONFIG[family]
         output_key = config["output"]
-        locations = _load_locations(os.path.join(directory, "GeoLite2-City-Locations-en.csv"))
-        city_intervals = _read_city_intervals(
-            os.path.join(directory, config["city"]),
-            locations,
-        )
-        asn_intervals = _read_asn_intervals(os.path.join(directory, config["asn"]))
+        city_path = os.path.join(directory, config["city"])
+        asn_path = os.path.join(directory, config["asn"])
+        locations_path = os.path.join(directory, "GeoLite2-City-Locations-en.csv")
+        referenced_geoname_ids = _collect_city_geoname_ids(city_path)
+        locations = _load_locations_subset(locations_path, referenced_geoname_ids)
+        city_scan = _scan_interval_source_file(city_path)
+        asn_scan = _scan_interval_source_file(asn_path)
+        union_addresses = _count_union_addresses_from_sources(city_path, asn_path)
 
         output_path = os.path.join(directory, output_key)
         output_rows = 0
@@ -772,23 +1081,30 @@ def _process_family_job(
         asn_output_addresses = 0
 
         with open(output_path, "w", encoding="utf-8", newline="") as output_handle:
-            for row in _iter_combined_rows(city_intervals, asn_intervals, family):
+            for row in _iter_combined_rows(
+                _iter_city_intervals(city_path, locations),
+                _iter_asn_intervals(asn_path),
+                family,
+            ):
                 output_handle.write("|".join(row[field] for field in OUTPUT_FIELDS))
                 output_handle.write("\n")
 
                 row_addresses = int(row["endip"]) - int(row["startip"]) + 1
                 output_rows += 1
                 output_addresses += row_addresses
-                if row["country"]:
+                if row["country_iso_code"]:
                     geo_addresses += row_addresses
                 if row["asn"]:
                     asn_output_addresses += row_addresses
 
-        summary = _build_output_summary(
-            output_key,
-            city_intervals,
-            asn_intervals,
-            {
+        summary = _build_output_summary_from_counts(
+            output_key=output_key,
+            source_city_rows=city_scan["rows"],
+            source_asn_rows=asn_scan["rows"],
+            city_addresses=city_scan["addresses"],
+            asn_addresses=asn_scan["addresses"],
+            union_addresses=union_addresses,
+            stats={
                 "outputRows": output_rows,
                 "outputAddresses": output_addresses,
                 "geoAddresses": geo_addresses,

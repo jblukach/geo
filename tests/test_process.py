@@ -22,11 +22,10 @@ class CombineIntervalsTests(unittest.TestCase):
             {
                 "start": 0,
                 "end": 7,
-                "continent": "North America",
-                "country": "United States",
+                "continent_code": "NA",
+                "country_iso_code": "US",
                 "subdivision": "Ohio",
                 "city": "Columbus",
-                "timezone": "America/New_York",
             }
         ]
         asn_intervals = [
@@ -55,11 +54,10 @@ class CombineIntervalsTests(unittest.TestCase):
                     "network": "0.0.0.0/30",
                     "asn": "64500",
                     "organization": "Example A",
-                    "continent": "North America",
-                    "country": "United States",
+                    "continent_code": "NA",
+                    "country_iso_code": "US",
                     "subdivision": "Ohio",
                     "city": "Columbus",
-                    "timezone": "America/New_York",
                 },
                 {
                     "startip": "4",
@@ -67,11 +65,10 @@ class CombineIntervalsTests(unittest.TestCase):
                     "network": "0.0.0.4/30",
                     "asn": "",
                     "organization": "",
-                    "continent": "North America",
-                    "country": "United States",
+                    "continent_code": "NA",
+                    "country_iso_code": "US",
                     "subdivision": "Ohio",
                     "city": "Columbus",
-                    "timezone": "America/New_York",
                 },
                 {
                     "startip": "8",
@@ -79,14 +76,22 @@ class CombineIntervalsTests(unittest.TestCase):
                     "network": "0.0.0.8/29",
                     "asn": "64501",
                     "organization": "Example B",
-                    "continent": "",
-                    "country": "",
+                    "continent_code": "",
+                    "country_iso_code": "",
                     "subdivision": "",
                     "city": "",
-                    "timezone": "",
                 },
             ],
         )
+
+    def test_ipv6_rows_include_integer_start_and_end_ip(self):
+        start_ip = (123 << process.IPV6_SCORE_BITS) + process.IPV6_SCORE_MASK
+        end_ip = start_ip + 2
+
+        rows = process._segment_to_rows(start_ip, end_ip, 6, None, None)
+
+        self.assertEqual([row["startip"] for row in rows], [str(start_ip), str(start_ip + 1)])
+        self.assertEqual([row["endip"] for row in rows], [str(start_ip), str(end_ip)])
 
 
 class BuildOutputsTests(unittest.TestCase):
@@ -97,7 +102,9 @@ class BuildOutputsTests(unittest.TestCase):
                 os.path.join(directory, "GeoLite2-City-Locations-en.csv"),
                 [
                     "geoname_id",
+                    "continent_code",
                     "continent_name",
+                    "country_iso_code",
                     "country_name",
                     "subdivision_1_name",
                     "city_name",
@@ -106,7 +113,9 @@ class BuildOutputsTests(unittest.TestCase):
                 [
                     {
                         "geoname_id": "100",
+                        "continent_code": "NA",
                         "continent_name": "North America",
+                        "country_iso_code": "US",
                         "country_name": "United States",
                         "subdivision_1_name": "Ohio",
                         "city_name": "Columbus",
@@ -114,7 +123,9 @@ class BuildOutputsTests(unittest.TestCase):
                     },
                     {
                         "geoname_id": "200",
+                        "continent_code": "EU",
                         "continent_name": "Europe",
+                        "country_iso_code": "DE",
                         "country_name": "Germany",
                         "subdivision_1_name": "Berlin",
                         "city_name": "Berlin",
@@ -183,14 +194,14 @@ class BuildOutputsTests(unittest.TestCase):
         self.assertEqual(
             ipv4_lines,
             [
-                "16777216|16777217|1.0.0.0/31|13335|Cloudflare|North America|United States|Ohio|Columbus|America/New_York"
+                "16777216|16777217|1.0.0.0/31|13335|Cloudflare|NA|US|Ohio|Columbus"
             ],
         )
         self.assertEqual(
             ipv6_lines,
             [
-                "42540766411282592856903984951653826560|42540766411282592856903984951653826561|2001:db8::/127|64510|Example IPv6|Europe|Germany|Berlin|Berlin|Europe/Berlin",
-                "42540766411282592856903984951653826562|42540766411282592856903984951653826563|2001:db8::2/127|64510|Example IPv6|||||",
+                "42540766411282592856903984951653826560|42540766411282592856903984951653826561|2001:db8::/127|64510|Example IPv6|EU|DE||Berlin",
+                "42540766411282592856903984951653826562|42540766411282592856903984951653826563|2001:db8::2/127|64510|Example IPv6||||",
             ],
         )
 
@@ -200,7 +211,9 @@ class BuildOutputsTests(unittest.TestCase):
                 os.path.join(directory, "GeoLite2-City-Locations-en.csv"),
                 [
                     "geoname_id",
+                    "continent_code",
                     "continent_name",
+                    "country_iso_code",
                     "country_name",
                     "subdivision_1_name",
                     "city_name",
@@ -209,7 +222,9 @@ class BuildOutputsTests(unittest.TestCase):
                 [
                     {
                         "geoname_id": "100",
+                        "continent_code": "NA",
                         "continent_name": "North America",
+                        "country_iso_code": "US",
                         "country_name": "United States",
                         "subdivision_1_name": "Ohio",
                         "city_name": "Columbus",
@@ -217,7 +232,9 @@ class BuildOutputsTests(unittest.TestCase):
                     },
                     {
                         "geoname_id": "200",
+                        "continent_code": "EU",
                         "continent_name": "Europe",
+                        "country_iso_code": "DE",
                         "country_name": "Germany",
                         "subdivision_1_name": "Berlin",
                         "city_name": "Berlin",
@@ -323,6 +340,67 @@ class HandlerTests(unittest.TestCase):
                     "https://example.com/queue",
                     {
                         "family": 4,
+                        "jobType": "family_build",
+                        "sourceSignature": mock.ANY,
+                    },
+                ),
+            ],
+        )
+
+    def test_handler_enqueues_ipv6_family_for_prefixed_key(self):
+        queued_messages = []
+
+        class FakeS3Client:
+
+            def head_object(self, Bucket, Key):
+                del Bucket
+                return {
+                    "ETag": f'"etag-{Key}"',
+                    "LastModified": "2026-05-31T00:00:00+00:00",
+                }
+
+        class FakeSqsClient:
+
+            def send_message(self, QueueUrl, MessageBody):
+                queued_messages.append((QueueUrl, json_loads(MessageBody)))
+                return {"MessageId": "id"}
+
+        event = {
+            "Records": [
+                {
+                    "body": '{"detail":{"bucket":{"name":"download-bucket"},"object":{"key":"incoming/maxmind/GeoLite2-ASN-Blocks-IPv6.csv"}}}'
+                }
+            ]
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DOWNLOAD_BUCKET_NAME": "download-bucket",
+                "PROCESSED_BUCKET_NAME": "processed-bucket",
+                "PROCESS_QUEUE_URL": "https://example.com/queue",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(
+                process,
+                "_boto3_client",
+                side_effect=lambda service: FakeS3Client() if service == "s3" else FakeSqsClient(),
+            ):
+                response = process.handler(event, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(response["skipped"])
+        self.assertEqual(response["skipReason"], "queued_family_jobs")
+        self.assertEqual(response["queuedFamilies"], [6])
+        self.assertEqual(response["impactedFamilies"], [6])
+        self.assertEqual(
+            queued_messages,
+            [
+                (
+                    "https://example.com/queue",
+                    {
+                        "family": 6,
                         "jobType": "family_build",
                         "sourceSignature": mock.ANY,
                     },

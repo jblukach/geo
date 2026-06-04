@@ -93,10 +93,10 @@ class GeoProcessStack(Stack):
                     },
                     "object": {
                         "key": [
-                            "GeoLite2-ASN-Blocks-IPv4.csv",
-                            "GeoLite2-ASN-Blocks-IPv6.csv",
-                            "GeoLite2-City-Blocks-IPv4.csv",
-                            "GeoLite2-City-Blocks-IPv6.csv",
+                            {"suffix": "GeoLite2-ASN-Blocks-IPv4.csv"},
+                            {"suffix": "GeoLite2-ASN-Blocks-IPv6.csv"},
+                            {"suffix": "GeoLite2-City-Blocks-IPv4.csv"},
+                            {"suffix": "GeoLite2-City-Blocks-IPv6.csv"},
                         ],
                     },
                 },
