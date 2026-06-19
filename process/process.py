@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import urllib.parse
+from datetime import timedelta
 from typing import Any
 
 _S3_MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB (S3 minimum part size is 5 MB)
@@ -20,6 +21,13 @@ TRIGGER_SOURCE_FILES = {
 
 JOB_TYPE_SOURCE_BUILD = "source_build"
 MOMENTO_SET_PREFIX = "geo"
+MOMENTO_SECRET_KEY_DEFAULT = "MOMENTO"
+MOMENTO_ENDPOINT_SECRET_KEY_DEFAULT = "MOMENTO_ENDPOINT"
+MOMENTO_RELEASE_ENV = "MOMENTO_RELEASE"
+MOMENTO_CACHE_NAMES_BY_SOURCE_ENV = "MOMENTO_CACHE_NAMES_BY_SOURCE"
+MOMENTO_CACHE_NAME_ENV = "MOMENTO_CACHE_NAME"
+MOMENTO_SORTED_SET_BATCH_SIZE_ENV = "MOMENTO_SORTED_SET_BATCH_SIZE"
+MOMENTO_SORTED_SET_BATCH_SIZE_DEFAULT = 250
 
 ASN_OUTPUT_FIELDS = (
     "momento_score",
@@ -70,6 +78,10 @@ SOURCE_OUTPUT_CONFIG = {
     },
 }
 
+MOMENTO_SOURCE_OUTPUTS = {
+    config["output"] for config in SOURCE_OUTPUT_CONFIG.values()
+}
+
 
 _RUNTIME_STATE = {
     "last_processed_source_signatures": {
@@ -94,6 +106,359 @@ def _log_event(event_name: str, **fields) -> None:
     payload = {"event": event_name}
     payload.update(fields)
     print(json.dumps(payload, sort_keys=True))
+
+
+def _momento_set_prefix() -> str:
+    prefix = os.environ.get("MOMENTO_SET_PREFIX", MOMENTO_SET_PREFIX).strip() or MOMENTO_SET_PREFIX
+    release = os.environ.get(MOMENTO_RELEASE_ENV, "").strip()
+    if not release:
+        return prefix
+    return f"{prefix}:{release}"
+
+
+def _secret_string_value(secret_name: str) -> str:
+    secrets_client = _boto3_client("secretsmanager")
+    response = secrets_client.get_secret_value(SecretId=secret_name)
+    return str(response.get("SecretString", ""))
+
+
+def _momento_token_from_secret(secret_name: str, secret_key: str) -> str:
+    secret_string = _secret_string_value(secret_name)
+    if not secret_string:
+        return ""
+
+    try:
+        secret_payload = json.loads(secret_string)
+    except json.JSONDecodeError:
+        # Support plain-string secret values when the secret is not a JSON object.
+        return secret_string
+
+    value = secret_payload.get(secret_key)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _momento_endpoint_from_secret(secret_name: str, secret_key: str) -> str:
+    secret_string = _secret_string_value(secret_name)
+    if not secret_string:
+        return ""
+
+    try:
+        secret_payload = json.loads(secret_string)
+    except json.JSONDecodeError:
+        return ""
+
+    value = secret_payload.get(secret_key)
+    if value is None:
+        for fallback_key in ("MOMENTO_ENDPOINT", "endpoint", "momento_endpoint"):
+            value = secret_payload.get(fallback_key)
+            if value is not None:
+                break
+
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _momento_configuration(configurations):
+    for provider_name in ("InRegion", "Laptop", "Lambda"):
+        provider = getattr(configurations, provider_name, None)
+        if provider is None:
+            continue
+        for selector_name in ("latest", "v1"):
+            selector = getattr(provider, selector_name, None)
+            if selector is None:
+                continue
+            try:
+                return selector()
+            except TypeError:
+                continue
+    return None
+
+
+def _momento_normalize_endpoint(endpoint: str) -> str:
+    value = endpoint.strip()
+    if not value:
+        return ""
+
+    if "://" in value:
+        parsed = urllib.parse.urlparse(value)
+        value = parsed.netloc or parsed.path
+
+    value = value.split("/", 1)[0]
+    if value.endswith(":443"):
+        value = value[:-4]
+
+    for prefix in ("control.", "cache.", "token."):
+        if value.startswith(prefix):
+            return value[len(prefix):]
+
+    return value
+
+
+def _momento_credential_provider(credential_provider, auth_token: str, endpoint: str = ""):
+    from_string = getattr(credential_provider, "from_string", None)
+    fallback_error: BaseException | None = None
+
+    if from_string is not None:
+        try:
+            return from_string(auth_token)
+        except TypeError as exc:
+            fallback_error = exc
+        except Exception as exc:  # pragma: no cover - depends on Momento SDK internals
+            message = str(exc).lower()
+            if "v2 api key" not in message:
+                raise
+            fallback_error = exc
+
+    normalized_endpoint = _momento_normalize_endpoint(endpoint)
+
+    from_api_key_v2 = getattr(credential_provider, "from_api_key_v2", None)
+    if from_api_key_v2 is not None:
+        if not normalized_endpoint:
+            raise RuntimeError(
+                "Momento v2 API key requires MOMENTO_ENDPOINT (or MOMENTO_ENDPOINT value in secret)."
+            )
+        try:
+            return from_api_key_v2(auth_token, normalized_endpoint)
+        except TypeError as exc:
+            fallback_error = exc
+
+    for method_name in (
+        "from_disposable_token",
+        "from_api_key",
+        "from_api_key_string",
+    ):
+        method = getattr(credential_provider, method_name, None)
+        if method is None:
+            continue
+        try:
+            return method(auth_token)
+        except TypeError as exc:
+            fallback_error = exc
+            continue
+
+    if fallback_error is not None:
+        raise fallback_error
+
+    raise RuntimeError("No supported Momento credential provider method found")
+
+
+def _momento_cache_client(auth_token: str, endpoint: str = ""):
+    from momento import CacheClient, Configurations, CredentialProvider  # type: ignore[import-not-found]
+
+    configuration = _momento_configuration(Configurations)
+    kwargs: dict[str, Any] = {
+        "credential_provider": _momento_credential_provider(CredentialProvider, auth_token, endpoint),
+    }
+
+    if configuration is not None:
+        kwargs["configuration"] = configuration
+
+    try:
+        return CacheClient(default_ttl=timedelta(days=30), **kwargs)
+    except TypeError:
+        return CacheClient(**kwargs)
+
+
+def _momento_put_sorted_set_element(
+    client,
+    cache_name: str,
+    set_name: str,
+    score: str,
+    value: str,
+) -> None:
+    score_float = float(score)
+    call_attempts = (
+        (
+            (),
+            {
+                "cache_name": cache_name,
+                "set_name": set_name,
+                "value": value,
+                "score": score_float,
+            },
+        ),
+        ((cache_name, set_name, value, score_float), {}),
+        ((cache_name, set_name, value, score), {}),
+        (
+            (),
+            {
+                "cache_name": cache_name,
+                "set_name": set_name,
+                "element": value,
+                "score": score_float,
+            },
+        ),
+    )
+
+    last_error: BaseException | None = None
+    for args, kwargs in call_attempts:
+        try:
+            client.sorted_set_put_element(*args, **kwargs)
+            return
+        except (TypeError, AttributeError, ValueError) as exc:  # pragma: no cover - depends on Momento SDK signature
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+
+
+def _momento_put_sorted_set_elements(
+    client,
+    cache_name: str,
+    set_name: str,
+    elements: dict[str, float],
+) -> None:
+    response = client.sorted_set_put_elements(cache_name, set_name, elements)
+
+    from momento.responses.data.sorted_set.put_elements import (  # type: ignore[import-not-found]
+        CacheSortedSetPutElements,
+    )
+
+    if isinstance(response, CacheSortedSetPutElements.Error):
+        raise RuntimeError(
+            f"Momento sorted_set_put_elements failed for cache {cache_name} set {set_name}: {response.message}"
+        )
+
+
+def _momento_value_for_output_row(output_type: str, row: dict[str, str]) -> str:
+    payload = {
+        "ip_version": row["ip_version"],
+        "prefix_len": row["prefix_len"],
+        "range_start_hex": row["range_start_hex"],
+        "range_end_hex": row["range_end_hex"],
+        "network": row["network"],
+    }
+
+    if output_type == "asn":
+        payload["asn"] = row["asn"]
+        payload["organization"] = row["organization"]
+    else:
+        payload["country_iso_code"] = row["country_iso_code"]
+        payload["country_name"] = row["country_name"]
+        payload["subdivision"] = row["subdivision"]
+        payload["city"] = row["city"]
+
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _momento_sorted_set_batch_size() -> int:
+    raw_value = os.environ.get(MOMENTO_SORTED_SET_BATCH_SIZE_ENV, "").strip()
+    if not raw_value:
+        return MOMENTO_SORTED_SET_BATCH_SIZE_DEFAULT
+
+    try:
+        batch_size = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid {MOMENTO_SORTED_SET_BATCH_SIZE_ENV}: {raw_value}") from exc
+
+    if batch_size <= 0:
+        raise RuntimeError(f"{MOMENTO_SORTED_SET_BATCH_SIZE_ENV} must be greater than zero")
+
+    return batch_size
+
+
+def _momento_cache_name_for_source(source_key: str) -> str:
+    cache_names_raw = os.environ.get(MOMENTO_CACHE_NAMES_BY_SOURCE_ENV, "").strip()
+    if cache_names_raw:
+        try:
+            cache_names = json.loads(cache_names_raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Invalid {MOMENTO_CACHE_NAMES_BY_SOURCE_ENV} JSON"
+            ) from exc
+
+        cache_name = str(cache_names.get(source_key, "")).strip()
+        if cache_name:
+            return cache_name
+
+        raise RuntimeError(f"No Momento cache configured for source {source_key}")
+
+    cache_name = os.environ.get(MOMENTO_CACHE_NAME_ENV, "").strip()
+    if cache_name:
+        return cache_name
+
+    raise RuntimeError("Missing Momento cache configuration")
+
+
+def _momento_context(cache_name: str) -> dict[str, Any] | None:
+    secret_name = os.environ.get("MOMENTO_SECRET_NAME", "").strip()
+    secret_key = os.environ.get("MOMENTO_SECRET_KEY", MOMENTO_SECRET_KEY_DEFAULT).strip() or MOMENTO_SECRET_KEY_DEFAULT
+    endpoint_secret_key = (
+        os.environ.get("MOMENTO_ENDPOINT_SECRET_KEY", MOMENTO_ENDPOINT_SECRET_KEY_DEFAULT).strip()
+        or MOMENTO_ENDPOINT_SECRET_KEY_DEFAULT
+    )
+    endpoint_override = os.environ.get("MOMENTO_ENDPOINT", "").strip()
+
+    if not cache_name or not secret_name:
+        return None
+
+    token = _momento_token_from_secret(secret_name, secret_key)
+    if not token:
+        return None
+
+    endpoint = endpoint_override or _momento_endpoint_from_secret(secret_name, endpoint_secret_key)
+
+    client = _momento_cache_client(token, endpoint)
+    return {
+        "cache_name": cache_name,
+        "client": client,
+        "loaded_rows": 0,
+        "set_names": set(),
+    }
+
+
+def _momento_add_output_row(
+    momento_context: dict[str, Any] | None,
+    output_key: str,
+    output_type: str,
+    row: dict[str, str],
+) -> None:
+    if momento_context is None:
+        return
+    if output_key not in MOMENTO_SOURCE_OUTPUTS:
+        return
+
+    set_name = row["momento_set"]
+    _momento_put_sorted_set_element(
+        momento_context["client"],
+        momento_context["cache_name"],
+        set_name,
+        row["momento_score"],
+        _momento_value_for_output_row(output_type, row),
+    )
+    momento_context["loaded_rows"] += 1
+    momento_context["set_names"].add(set_name)
+
+
+def _momento_add_output_rows(
+    momento_context: dict[str, Any] | None,
+    output_key: str,
+    output_type: str,
+    rows: list[dict[str, str]],
+) -> None:
+    del output_key
+    if momento_context is None:
+        return
+
+    batch_by_set: dict[str, dict[str, float]] = {}
+    for row in rows:
+        set_name = row["momento_set"]
+        elements = batch_by_set.setdefault(set_name, {})
+        elements[_momento_value_for_output_row(output_type, row)] = float(row["momento_score"])
+
+    for set_name, elements in batch_by_set.items():
+        _momento_put_sorted_set_elements(
+            momento_context["client"],
+            momento_context["cache_name"],
+            set_name,
+            elements,
+        )
+    momento_context["loaded_rows"] += len(rows)
+    for set_name in batch_by_set:
+        momento_context["set_names"].add(set_name)
 
 
 def _momento_score_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
@@ -133,7 +498,7 @@ def _momento_set_for_dataset_and_parsed_network(
     parsed_network: ipaddress._BaseNetwork,
 ) -> str:
     shard = _momento_shard_for_parsed_network(parsed_network)
-    return f"{MOMENTO_SET_PREFIX}:{dataset}:{shard}"
+    return f"{_momento_set_prefix()}:{dataset}:{shard}"
 
 
 def _momento_sort_key_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
@@ -182,8 +547,8 @@ def momento_lookup_fields_for_ip(ip_text: str) -> dict[str, str]:
         "sort_key": f"{int(prefix_len):03d}",
         "prefix_len": prefix_len,
         "ip_hex": ip_hex,
-        "asn_momento_set": f"{MOMENTO_SET_PREFIX}:asn:{shard}",
-        "city_momento_set": f"{MOMENTO_SET_PREFIX}:city:{shard}",
+        "asn_momento_set": f"{_momento_set_prefix()}:asn:{shard}",
+        "city_momento_set": f"{_momento_set_prefix()}:city:{shard}",
     }
 
 
@@ -593,6 +958,7 @@ def _process_source_job(
     download_bucket_name: str,
     processed_bucket_name: str,
     source_key: str,
+    momento_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as directory:
         config = SOURCE_OUTPUT_CONFIG[source_key]
@@ -601,6 +967,7 @@ def _process_source_job(
         output_key = config["output"]
 
         output_rows = 0
+        momento_rows: list[dict[str, str]] = []
 
         mpu = s3_client.create_multipart_upload(
             Bucket=processed_bucket_name,
@@ -627,19 +994,38 @@ def _process_source_job(
                 line = "|".join(row[field] for field in output_fields) + "\n"
                 buffer.write(line.encode("utf-8"))
                 output_rows += 1
+                if momento_context is not None and output_key in MOMENTO_SOURCE_OUTPUTS:
+                    momento_rows.append(row)
 
-                if buffer.tell() >= _S3_MULTIPART_CHUNK_SIZE:
-                    buffer.seek(0)
-                    response = s3_client.upload_part(
-                        Bucket=processed_bucket_name,
-                        Key=output_key,
-                        PartNumber=part_number,
-                        UploadId=upload_id,
-                        Body=buffer,
+                if momento_context is not None and len(momento_rows) >= _momento_sorted_set_batch_size():
+                    _momento_add_output_rows(
+                        momento_context,
+                        output_key,
+                        config["type"],
+                        momento_rows,
                     )
-                    parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                    part_number += 1
-                    buffer = io.BytesIO()
+                    momento_rows = []
+
+            if momento_context is not None and momento_rows:
+                _momento_add_output_rows(
+                    momento_context,
+                    output_key,
+                    config["type"],
+                    momento_rows,
+                )
+
+            if buffer.tell() >= _S3_MULTIPART_CHUNK_SIZE:
+                buffer.seek(0)
+                response = s3_client.upload_part(
+                    Bucket=processed_bucket_name,
+                    Key=output_key,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=buffer,
+                )
+                parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
+                part_number += 1
+                buffer = io.BytesIO()
 
             remaining = buffer.tell()
             if remaining > 0:
@@ -688,6 +1074,7 @@ def _process_source_job(
     return {
         "sourceKey": source_key,
         "output": output_key,
+        "outputRows": output_rows,
     }
 
 
@@ -716,12 +1103,14 @@ def handler(event, context):
         processed_jobs = []
         for source_job in source_jobs:
             source_key = str(source_job["sourceKey"])
+            momento_context = _momento_context(_momento_cache_name_for_source(source_key))
             processed_jobs.append(
                 _process_source_job(
                     s3_client,
                     download_bucket_name,
                     processed_bucket_name,
                     source_key,
+                    momento_context,
                 )
             )
 
@@ -737,6 +1126,22 @@ def handler(event, context):
             durationMs=duration_ms,
             mode="worker",
         )
+        if momento_context is None:
+            _log_event(
+                "momento_load_skipped",
+                requestId=request_id,
+                reason="missing_momento_environment",
+                outputs=outputs,
+            )
+        else:
+            _log_event(
+                "momento_load_summary",
+                requestId=request_id,
+                cacheName=momento_context["cache_name"],
+                setCount=len(momento_context["set_names"]),
+                loadedRows=momento_context["loaded_rows"],
+                outputs=outputs,
+            )
 
         return {
             "statusCode": 200,
@@ -748,6 +1153,9 @@ def handler(event, context):
             "skipReason": "",
             "missingSourceFiles": [],
             "mode": "worker",
+            "momentoLoadedRows": 0 if momento_context is None else momento_context["loaded_rows"],
+            "momentoSetCount": 0 if momento_context is None else len(momento_context["set_names"]),
+            "momentoEnabled": momento_context is not None,
         }
 
     if not relevant_records:

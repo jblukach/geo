@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 import tempfile
 import unittest
@@ -16,6 +17,108 @@ def _write_csv(path, fieldnames, rows):
 
 
 class BuildOutputsTests(unittest.TestCase):
+
+    def test_momento_credential_provider_uses_from_string_for_legacy_token(self):
+        calls = []
+
+        class FakeCredentialProvider:
+
+            @staticmethod
+            def from_string(token):
+                calls.append(("from_string", token))
+                return "legacy-provider"
+
+            @staticmethod
+            def from_api_key(token):
+                calls.append(("from_api_key", token))
+                return "v2-provider"
+
+        provider = process._momento_credential_provider(FakeCredentialProvider, "legacy-token")
+
+        self.assertEqual(provider, "legacy-provider")
+        self.assertEqual(calls, [("from_string", "legacy-token")])
+
+    def test_momento_credential_provider_falls_back_to_api_key_for_v2_token(self):
+        calls = []
+
+        class FakeCredentialProvider:
+
+            @staticmethod
+            def from_string(token):
+                calls.append(("from_string", token))
+                raise ValueError("Unexpectedly received a v2 API key")
+
+            @staticmethod
+            def from_api_key_v2(token, endpoint):
+                calls.append(("from_api_key_v2", token, endpoint))
+                return "v2-provider"
+
+        provider = process._momento_credential_provider(
+            FakeCredentialProvider,
+            "momt_abc123",
+            "https://cache.cell-1-us-east-1-1.prod.a.momentohq.com",
+        )
+
+        self.assertEqual(provider, "v2-provider")
+        self.assertEqual(
+            calls,
+            [
+                ("from_string", "momt_abc123"),
+                ("from_api_key_v2", "momt_abc123", "cell-1-us-east-1-1.prod.a.momentohq.com"),
+            ],
+        )
+
+    def test_momento_credential_provider_requires_endpoint_for_v2_api_keys(self):
+        class FakeCredentialProvider:
+
+            @staticmethod
+            def from_string(token):
+                del token
+                raise ValueError("Unexpectedly received a v2 API key")
+
+            @staticmethod
+            def from_api_key_v2(token, endpoint):
+                del token, endpoint
+                return "v2-provider"
+
+        with self.assertRaisesRegex(RuntimeError, "MOMENTO_ENDPOINT"):
+            process._momento_credential_provider(FakeCredentialProvider, "momt_abc123", "")
+
+    def test_momento_credential_provider_raises_unexpected_from_string_error(self):
+        class FakeCredentialProvider:
+
+            @staticmethod
+            def from_string(token):
+                del token
+                raise ValueError("some other auth failure")
+
+        with self.assertRaisesRegex(ValueError, "some other auth failure"):
+            process._momento_credential_provider(FakeCredentialProvider, "legacy-token")
+
+    def test_momento_cache_name_for_source_uses_source_mapping(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MOMENTO_CACHE_NAMES_BY_SOURCE": json.dumps(
+                    {
+                        "GeoLite2-ASN-Blocks-IPv4.csv": "GeoLite2-ASN-Blocks-IPv4",
+                        "GeoLite2-ASN-Blocks-IPv6.csv": "GeoLite2-ASN-Blocks-IPv6",
+                        "GeoLite2-City-Blocks-IPv4.csv": "GeoLite2-City-Blocks-IPv4",
+                        "GeoLite2-City-Blocks-IPv6.csv": "GeoLite2-City-Blocks-IPv6",
+                    },
+                    sort_keys=True,
+                ),
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                process._momento_cache_name_for_source("GeoLite2-ASN-Blocks-IPv4.csv"),
+                "GeoLite2-ASN-Blocks-IPv4",
+            )
+            self.assertEqual(
+                process._momento_cache_name_for_source("GeoLite2-City-Blocks-IPv6.csv"),
+                "GeoLite2-City-Blocks-IPv6",
+            )
 
     def test_momento_lookup_fields_for_ip_match_network_scores(self):
         ipv4_lookup = process.momento_lookup_fields_for_ip("1.0.0.1")
@@ -50,6 +153,20 @@ class BuildOutputsTests(unittest.TestCase):
             process.momento_lookup_score_for_ip("1.0.0.1"),
             process.momento_lookup_fields_for_ip("1.0.0.1")["momento_score"],
         )
+
+    def test_momento_lookup_fields_include_release_namespace_when_configured(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MOMENTO_SET_PREFIX": "geo",
+                "MOMENTO_RELEASE": "r20260619",
+            },
+            clear=False,
+        ):
+            lookup = process.momento_lookup_fields_for_ip("1.0.0.1")
+
+        self.assertTrue(lookup["asn_momento_set"].startswith("geo:r20260619:asn:v4:"))
+        self.assertTrue(lookup["city_momento_set"].startswith("geo:r20260619:city:v4:"))
 
     def test_uses_registered_country_geoname_when_geoname_missing(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -298,6 +415,67 @@ class BuildOutputsTests(unittest.TestCase):
         self.assertEqual(artifacts["GeoLite2-City-Blocks-IPv4.txt"]["summary"]["outputRows"], 1)
         self.assertEqual(artifacts["GeoLite2-City-Blocks-IPv6.txt"]["summary"]["outputRows"], 1)
 
+    def test_build_outputs_uses_release_namespace_when_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _write_csv(
+                os.path.join(directory, "GeoLite2-City-Locations-en.csv"),
+                [
+                    "geoname_id",
+                    "continent_code",
+                    "continent_name",
+                    "country_iso_code",
+                    "country_name",
+                    "subdivision_1_name",
+                    "city_name",
+                    "time_zone",
+                ],
+                [
+                    {
+                        "geoname_id": "100",
+                        "continent_code": "NA",
+                        "continent_name": "North America",
+                        "country_iso_code": "US",
+                        "country_name": "United States",
+                        "subdivision_1_name": "Ohio",
+                        "city_name": "Columbus",
+                        "time_zone": "America/New_York",
+                    },
+                ],
+            )
+            _write_csv(
+                os.path.join(directory, "GeoLite2-City-Blocks-IPv4.csv"),
+                ["network", "geoname_id", "registered_country_geoname_id"],
+                [{"network": "1.0.0.0/31", "geoname_id": "100", "registered_country_geoname_id": ""}],
+            )
+            _write_csv(
+                os.path.join(directory, "GeoLite2-ASN-Blocks-IPv4.csv"),
+                ["network", "autonomous_system_number", "autonomous_system_organization"],
+                [{"network": "1.0.0.0/31", "autonomous_system_number": "13335", "autonomous_system_organization": "Cloudflare"}],
+            )
+            _write_csv(
+                os.path.join(directory, "GeoLite2-City-Blocks-IPv6.csv"),
+                ["network", "geoname_id", "registered_country_geoname_id"],
+                [{"network": "2001:db8::/127", "geoname_id": "100", "registered_country_geoname_id": ""}],
+            )
+            _write_csv(
+                os.path.join(directory, "GeoLite2-ASN-Blocks-IPv6.csv"),
+                ["network", "autonomous_system_number", "autonomous_system_organization"],
+                [{"network": "2001:db8::/127", "autonomous_system_number": "64510", "autonomous_system_organization": "Example IPv6"}],
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MOMENTO_SET_PREFIX": "geo",
+                    "MOMENTO_RELEASE": "r20260619",
+                },
+                clear=False,
+            ):
+                outputs = process.build_outputs_from_directory(directory)
+
+        asn_ipv4_first_line = outputs["GeoLite2-ASN-Blocks-IPv4.txt"].strip().splitlines()[0]
+        self.assertIn("geo:r20260619:asn:v4:", asn_ipv4_first_line)
+
 
 class HandlerTests(unittest.TestCase):
 
@@ -336,6 +514,15 @@ class HandlerTests(unittest.TestCase):
                 "DOWNLOAD_BUCKET_NAME": "download-bucket",
                 "PROCESSED_BUCKET_NAME": "processed-bucket",
                 "PROCESS_QUEUE_URL": "https://example.com/queue",
+                "MOMENTO_CACHE_NAMES_BY_SOURCE": json.dumps(
+                    {
+                        "GeoLite2-ASN-Blocks-IPv4.csv": "GeoLite2-ASN-Blocks-IPv4",
+                        "GeoLite2-ASN-Blocks-IPv6.csv": "GeoLite2-ASN-Blocks-IPv6",
+                        "GeoLite2-City-Blocks-IPv4.csv": "GeoLite2-City-Blocks-IPv4",
+                        "GeoLite2-City-Blocks-IPv6.csv": "GeoLite2-City-Blocks-IPv6",
+                    },
+                    sort_keys=True,
+                ),
             },
             clear=False,
         ):
@@ -397,6 +584,15 @@ class HandlerTests(unittest.TestCase):
                 "DOWNLOAD_BUCKET_NAME": "download-bucket",
                 "PROCESSED_BUCKET_NAME": "processed-bucket",
                 "PROCESS_QUEUE_URL": "https://example.com/queue",
+                "MOMENTO_CACHE_NAMES_BY_SOURCE": json.dumps(
+                    {
+                        "GeoLite2-ASN-Blocks-IPv4.csv": "GeoLite2-ASN-Blocks-IPv4",
+                        "GeoLite2-ASN-Blocks-IPv6.csv": "GeoLite2-ASN-Blocks-IPv6",
+                        "GeoLite2-City-Blocks-IPv4.csv": "GeoLite2-City-Blocks-IPv4",
+                        "GeoLite2-City-Blocks-IPv6.csv": "GeoLite2-City-Blocks-IPv6",
+                    },
+                    sort_keys=True,
+                ),
             },
             clear=False,
         ):
@@ -481,6 +677,15 @@ class HandlerTests(unittest.TestCase):
                 "DOWNLOAD_BUCKET_NAME": "download-bucket",
                 "PROCESSED_BUCKET_NAME": "processed-bucket",
                 "PROCESS_QUEUE_URL": "https://example.com/queue",
+                "MOMENTO_CACHE_NAMES_BY_SOURCE": json.dumps(
+                    {
+                        "GeoLite2-ASN-Blocks-IPv4.csv": "GeoLite2-ASN-Blocks-IPv4",
+                        "GeoLite2-ASN-Blocks-IPv6.csv": "GeoLite2-ASN-Blocks-IPv6",
+                        "GeoLite2-City-Blocks-IPv4.csv": "GeoLite2-City-Blocks-IPv4",
+                        "GeoLite2-City-Blocks-IPv6.csv": "GeoLite2-City-Blocks-IPv6",
+                    },
+                    sort_keys=True,
+                ),
             },
             clear=False,
         ):
@@ -516,6 +721,107 @@ class HandlerTests(unittest.TestCase):
             ),
             uploaded[("processed-bucket", "GeoLite2-ASN-Blocks-IPv4.txt")],
         )
+
+    def test_handler_worker_job_loads_rows_into_momento_when_enabled(self):
+        source_files = {
+            "GeoLite2-ASN-Blocks-IPv4.csv": "network,autonomous_system_number,autonomous_system_organization\n1.0.0.0/31,13335,Cloudflare\n",
+        }
+        uploaded = {}
+
+        class FakeS3Client:
+
+            def create_multipart_upload(self, Bucket, Key, ContentType):
+                del Bucket, Key, ContentType
+                return {"UploadId": "upload-id"}
+
+            def download_file(self, bucket, key, filename):
+                del bucket
+                with open(filename, "w", encoding="utf-8") as handle:
+                    handle.write(source_files[key])
+
+            def upload_part(self, Bucket, Key, PartNumber, UploadId, Body):
+                del Bucket, PartNumber, UploadId
+                Body.seek(0)
+                uploaded[Key] = Body.read().decode("utf-8")
+                return {"ETag": '"etag"'}
+
+            def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload):
+                del Bucket, Key, UploadId, MultipartUpload
+
+            def abort_multipart_upload(self, Bucket, Key, UploadId):
+                del Bucket, Key, UploadId
+                raise AssertionError("abort_multipart_upload should not be called")
+
+        momento_calls = []
+
+        class FakeMomentoClient:
+
+            def sorted_set_put_elements(self, cache_name, set_name, elements):
+                momento_calls.append(
+                    {
+                        "cache_name": cache_name,
+                        "set_name": set_name,
+                        "elements": dict(elements),
+                    }
+                )
+
+                class Success:
+                    pass
+
+                return Success()
+
+        event = {
+            "Records": [
+                {
+                    "body": '{"jobType":"source_build","sourceKey":"GeoLite2-ASN-Blocks-IPv4.csv"}'
+                }
+            ]
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DOWNLOAD_BUCKET_NAME": "download-bucket",
+                "PROCESSED_BUCKET_NAME": "processed-bucket",
+                "PROCESS_QUEUE_URL": "https://example.com/queue",
+                "MOMENTO_CACHE_NAMES_BY_SOURCE": json.dumps(
+                    {
+                        "GeoLite2-ASN-Blocks-IPv4.csv": "GeoLite2-ASN-Blocks-IPv4",
+                        "GeoLite2-ASN-Blocks-IPv6.csv": "GeoLite2-ASN-Blocks-IPv6",
+                        "GeoLite2-City-Blocks-IPv4.csv": "GeoLite2-City-Blocks-IPv4",
+                        "GeoLite2-City-Blocks-IPv6.csv": "GeoLite2-City-Blocks-IPv6",
+                    },
+                    sort_keys=True,
+                ),
+            },
+            clear=False,
+        ):
+            with mock.patch.object(
+                process,
+                "_boto3_client",
+                return_value=FakeS3Client(),
+            ):
+                with mock.patch.object(
+                    process,
+                    "_momento_context",
+                    return_value={
+                        "cache_name": "geo",
+                        "client": FakeMomentoClient(),
+                        "loaded_rows": 0,
+                        "set_names": set(),
+                    },
+                ):
+                    response = process.handler(event, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertTrue(response["momentoEnabled"])
+        self.assertEqual(response["momentoLoadedRows"], 1)
+        self.assertEqual(response["momentoSetCount"], 1)
+        self.assertEqual(len(momento_calls), 1)
+        self.assertEqual(momento_calls[0]["cache_name"], "geo")
+        self.assertTrue(momento_calls[0]["set_name"].startswith("geo:asn:v4:"))
+        self.assertEqual(len(momento_calls[0]["elements"]), 1)
+        self.assertIn('"asn":"13335"', next(iter(momento_calls[0]["elements"])))
 
     def test_handler_skips_rebuild_until_all_source_files_exist(self):
         uploaded = {}
