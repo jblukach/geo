@@ -17,6 +17,40 @@ def _write_csv(path, fieldnames, rows):
 
 class BuildOutputsTests(unittest.TestCase):
 
+    def test_momento_lookup_fields_for_ip_match_network_scores(self):
+        ipv4_lookup = process.momento_lookup_fields_for_ip("1.0.0.1")
+        ipv6_lookup = process.momento_lookup_fields_for_ip("2001:db8::1")
+
+        self.assertEqual(ipv4_lookup["ip_version"], "4")
+        self.assertEqual(
+            ipv4_lookup["momento_score"],
+            process._momento_score_for_network("1.0.0.1/32"),
+        )
+        self.assertEqual(ipv4_lookup["prefix_len"], "32")
+        self.assertEqual(ipv4_lookup["sort_key"], "032")
+        self.assertTrue(ipv4_lookup["shard"].startswith("v4:"))
+        self.assertTrue(ipv4_lookup["asn_momento_set"].startswith("geo:asn:v4:"))
+        self.assertTrue(ipv4_lookup["city_momento_set"].startswith("geo:city:v4:"))
+        self.assertEqual(len(ipv4_lookup["ip_hex"]), 32)
+
+        self.assertEqual(ipv6_lookup["ip_version"], "6")
+        self.assertEqual(
+            ipv6_lookup["momento_score"],
+            process._momento_score_for_network("2001:db8::1/128"),
+        )
+        self.assertEqual(ipv6_lookup["prefix_len"], "128")
+        self.assertEqual(ipv6_lookup["sort_key"], "128")
+        self.assertTrue(ipv6_lookup["shard"].startswith("v6:"))
+        self.assertTrue(ipv6_lookup["asn_momento_set"].startswith("geo:asn:v6:"))
+        self.assertTrue(ipv6_lookup["city_momento_set"].startswith("geo:city:v6:"))
+        self.assertEqual(len(ipv6_lookup["ip_hex"]), 32)
+
+    def test_momento_lookup_score_for_ip_returns_score(self):
+        self.assertEqual(
+            process.momento_lookup_score_for_ip("1.0.0.1"),
+            process.momento_lookup_fields_for_ip("1.0.0.1")["momento_score"],
+        )
+
     def test_uses_registered_country_geoname_when_geoname_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             _write_csv(
@@ -117,25 +151,85 @@ class BuildOutputsTests(unittest.TestCase):
         self.assertEqual(
             asn_ipv4_lines,
             [
-                "16777216|16777217|1.0.0.0/31|13335|Cloudflare"
+                "|".join(
+                    [
+                        process._momento_score_for_network("1.0.0.0/31"),
+                        "4",
+                        process._momento_shard_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False)),
+                        process._momento_set_for_dataset_and_parsed_network("asn", process.ipaddress.ip_network("1.0.0.0/31", strict=False)),
+                        "031",
+                        "31",
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False))[0],
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False))[1],
+                        "1.0.0.0/31",
+                        "13335",
+                        "Cloudflare",
+                    ]
+                )
             ],
         )
         self.assertEqual(
             asn_ipv6_lines,
             [
-                "42540766411282592856903984951653826560|42540766411282592856903984951653826563|2001:db8::/126|64510|Example IPv6",
+                "|".join(
+                    [
+                        process._momento_score_for_network("2001:db8::/126"),
+                        "6",
+                        process._momento_shard_for_parsed_network(process.ipaddress.ip_network("2001:db8::/126", strict=False)),
+                        process._momento_set_for_dataset_and_parsed_network("asn", process.ipaddress.ip_network("2001:db8::/126", strict=False)),
+                        "126",
+                        "126",
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("2001:db8::/126", strict=False))[0],
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("2001:db8::/126", strict=False))[1],
+                        "2001:db8::/126",
+                        "64510",
+                        "Example IPv6",
+                    ]
+                ),
             ],
         )
         self.assertEqual(
             city_ipv4_lines,
             [
-                "16777216|16777217|1.0.0.0/31|NA|US|Ohio|Columbus"
+                "|".join(
+                    [
+                        process._momento_score_for_network("1.0.0.0/31"),
+                        "4",
+                        process._momento_shard_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False)),
+                        process._momento_set_for_dataset_and_parsed_network("city", process.ipaddress.ip_network("1.0.0.0/31", strict=False)),
+                        "031",
+                        "31",
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False))[0],
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False))[1],
+                        "1.0.0.0/31",
+                        "US",
+                        "United States",
+                        "Ohio",
+                        "Columbus",
+                    ]
+                )
             ],
         )
         self.assertEqual(
             city_ipv6_lines,
             [
-                "42540766411282592856903984951653826560|42540766411282592856903984951653826561|2001:db8::/127|EU|DE||Berlin",
+                "|".join(
+                    [
+                        process._momento_score_for_network("2001:db8::/127"),
+                        "6",
+                        process._momento_shard_for_parsed_network(process.ipaddress.ip_network("2001:db8::/127", strict=False)),
+                        process._momento_set_for_dataset_and_parsed_network("city", process.ipaddress.ip_network("2001:db8::/127", strict=False)),
+                        "127",
+                        "127",
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("2001:db8::/127", strict=False))[0],
+                        process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("2001:db8::/127", strict=False))[1],
+                        "2001:db8::/127",
+                        "DE",
+                        "Germany",
+                        "",
+                        "Berlin",
+                    ]
+                ),
             ],
         )
 
@@ -404,7 +498,24 @@ class HandlerTests(unittest.TestCase):
             sorted(uploaded.keys()),
             [("processed-bucket", "GeoLite2-ASN-Blocks-IPv4.txt")],
         )
-        self.assertIn("16777216|16777217|1.0.0.0/31|13335|Cloudflare", uploaded[("processed-bucket", "GeoLite2-ASN-Blocks-IPv4.txt")])
+        self.assertIn(
+            "|".join(
+                [
+                    process._momento_score_for_network("1.0.0.0/31"),
+                    "4",
+                    process._momento_shard_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False)),
+                    process._momento_set_for_dataset_and_parsed_network("asn", process.ipaddress.ip_network("1.0.0.0/31", strict=False)),
+                    "031",
+                    "31",
+                    process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False))[0],
+                    process._momento_range_hex_for_parsed_network(process.ipaddress.ip_network("1.0.0.0/31", strict=False))[1],
+                    "1.0.0.0/31",
+                    "13335",
+                    "Cloudflare",
+                ]
+            ),
+            uploaded[("processed-bucket", "GeoLite2-ASN-Blocks-IPv4.txt")],
+        )
 
     def test_handler_skips_rebuild_until_all_source_files_exist(self):
         uploaded = {}

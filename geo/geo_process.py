@@ -15,11 +15,22 @@ class GeoProcessStack(Stack):
         self,
         scope: Construct,
         construct_id: str,
-        download_bucket: _s3.IBucket,
-        processed_bucket: _s3.IBucket,
+        download_bucket_name: str,
+        processed_bucket_name: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        download_bucket = _s3.Bucket.from_bucket_name(
+            self,
+            "downloadbucket",
+            download_bucket_name,
+        )
+        processed_bucket = _s3.Bucket.from_bucket_name(
+            self,
+            "processedbucket",
+            processed_bucket_name,
+        )
 
         dead_letter_queue = _sqs.Queue(
             self,
@@ -55,7 +66,7 @@ class GeoProcessStack(Stack):
             memory_size=3008,
             environment={
                 "DOWNLOAD_BUCKET_NAME": download_bucket.bucket_name,
-                "PROCESSED_BUCKET_NAME": processed_bucket.bucket_name,
+                "PROCESSED_BUCKET_NAME": processed_bucket_name,
                 "PROCESS_QUEUE_URL": process_queue.queue_url,
             },
         )
@@ -89,7 +100,7 @@ class GeoProcessStack(Stack):
                 detail_type=["Object Created"],
                 detail={
                     "bucket": {
-                        "name": [download_bucket.bucket_name],
+                        "name": [download_bucket_name],
                     },
                     "object": {
                         "key": [

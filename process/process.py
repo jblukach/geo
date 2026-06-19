@@ -19,21 +19,34 @@ TRIGGER_SOURCE_FILES = {
 }
 
 JOB_TYPE_SOURCE_BUILD = "source_build"
+MOMENTO_SET_PREFIX = "geo"
 
 ASN_OUTPUT_FIELDS = (
-    "startip",
-    "endip",
+    "momento_score",
+    "ip_version",
+    "shard",
+    "momento_set",
+    "sort_key",
+    "prefix_len",
+    "range_start_hex",
+    "range_end_hex",
     "network",
     "asn",
     "organization",
 )
 
 CITY_OUTPUT_FIELDS = (
-    "startip",
-    "endip",
+    "momento_score",
+    "ip_version",
+    "shard",
+    "momento_set",
+    "sort_key",
+    "prefix_len",
+    "range_start_hex",
+    "range_end_hex",
     "network",
-    "continent_code",
     "country_iso_code",
+    "country_name",
     "subdivision",
     "city",
 )
@@ -42,22 +55,18 @@ SOURCE_OUTPUT_CONFIG = {
     "GeoLite2-ASN-Blocks-IPv4.csv": {
         "output": "GeoLite2-ASN-Blocks-IPv4.txt",
         "type": "asn",
-        "version": 4,
     },
     "GeoLite2-ASN-Blocks-IPv6.csv": {
         "output": "GeoLite2-ASN-Blocks-IPv6.txt",
         "type": "asn",
-        "version": 6,
     },
     "GeoLite2-City-Blocks-IPv4.csv": {
         "output": "GeoLite2-City-Blocks-IPv4.txt",
         "type": "city",
-        "version": 4,
     },
     "GeoLite2-City-Blocks-IPv6.csv": {
         "output": "GeoLite2-City-Blocks-IPv6.txt",
         "type": "city",
-        "version": 6,
     },
 }
 
@@ -87,9 +96,99 @@ def _log_event(event_name: str, **fields) -> None:
     print(json.dumps(payload, sort_keys=True))
 
 
-def _interval_from_network(network: str) -> tuple[int, int]:
+def _momento_score_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
+    start_ip = int(parsed_network.network_address)
+
+    # Momento sorted-set scores are numeric and precision-limited, so derive a
+    # compact family-aware score from the network start address.
+    if parsed_network.version == 4:
+        family_bit = 0
+        normalized_start = start_ip << 96
+    else:
+        family_bit = 1
+        normalized_start = start_ip
+
+    prefix = normalized_start >> (128 - 52)
+    return str((family_bit << 52) | prefix)
+
+
+def _momento_score_for_network(network: str) -> str:
     parsed_network = ipaddress.ip_network(network, strict=False)
-    return int(parsed_network.network_address), int(parsed_network.broadcast_address)
+    return _momento_score_for_parsed_network(parsed_network)
+
+
+def _momento_shard_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
+    start_ip = int(parsed_network.network_address)
+    if parsed_network.version == 4:
+        normalized_start = start_ip << 96
+    else:
+        normalized_start = start_ip
+
+    top16 = normalized_start >> (128 - 16)
+    return f"v{parsed_network.version}:{top16:04x}"
+
+
+def _momento_set_for_dataset_and_parsed_network(
+    dataset: str,
+    parsed_network: ipaddress._BaseNetwork,
+) -> str:
+    shard = _momento_shard_for_parsed_network(parsed_network)
+    return f"{MOMENTO_SET_PREFIX}:{dataset}:{shard}"
+
+
+def _momento_sort_key_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
+    return f"{parsed_network.prefixlen:03d}"
+
+
+def _normalized_bounds_for_parsed_network(
+    parsed_network: ipaddress._BaseNetwork,
+) -> tuple[int, int]:
+    start_ip = int(parsed_network.network_address)
+    end_ip = int(parsed_network.broadcast_address)
+    if parsed_network.version == 4:
+        return start_ip << 96, end_ip << 96
+    return start_ip, end_ip
+
+
+def _momento_range_hex_for_parsed_network(
+    parsed_network: ipaddress._BaseNetwork,
+) -> tuple[str, str]:
+    normalized_start, normalized_end = _normalized_bounds_for_parsed_network(parsed_network)
+    return f"{normalized_start:032x}", f"{normalized_end:032x}"
+
+
+def momento_lookup_fields_for_ip(ip_text: str) -> dict[str, str]:
+    parsed_ip = ipaddress.ip_address(ip_text)
+    ip_int = int(parsed_ip)
+
+    if parsed_ip.version == 4:
+        family_bit = 0
+        normalized_ip = ip_int << 96
+    else:
+        family_bit = 1
+        normalized_ip = ip_int
+
+    prefix = normalized_ip >> (128 - 52)
+    score = str((family_bit << 52) | prefix)
+    top16 = normalized_ip >> (128 - 16)
+    shard = f"v{parsed_ip.version}:{top16:04x}"
+    prefix_len = "32" if parsed_ip.version == 4 else "128"
+    ip_hex = f"{normalized_ip:032x}"
+
+    return {
+        "momento_score": score,
+        "ip_version": str(parsed_ip.version),
+        "shard": shard,
+        "sort_key": f"{int(prefix_len):03d}",
+        "prefix_len": prefix_len,
+        "ip_hex": ip_hex,
+        "asn_momento_set": f"{MOMENTO_SET_PREFIX}:asn:{shard}",
+        "city_momento_set": f"{MOMENTO_SET_PREFIX}:city:{shard}",
+    }
+
+
+def momento_lookup_score_for_ip(ip_text: str) -> str:
+    return momento_lookup_fields_for_ip(ip_text)["momento_score"]
 
 
 def _collect_city_geoname_ids(file_path: str) -> set[str]:
@@ -138,8 +237,8 @@ def _load_locations_subset(
 
         index = {name: position for position, name in enumerate(header)}
         geoname_index = index.get("geoname_id")
-        continent_code_index = index.get("continent_code")
         country_iso_code_index = index.get("country_iso_code")
+        country_name_index = index.get("country_name")
         subdivision_index = index.get("subdivision_1_name")
         city_index = index.get("city_name")
 
@@ -169,12 +268,12 @@ def _load_locations_subset(
                 subdivision = ""
 
             locations[geoname_id] = {
-                "continent_code": row[continent_code_index].strip()
-                if continent_code_index is not None and continent_code_index < len(row)
-                else "",
                 "country_iso_code": row[country_iso_code_index].strip()
                 if country_iso_code_index is not None
                 and country_iso_code_index < len(row)
+                else "",
+                "country_name": row[country_name_index].strip()
+                if country_name_index is not None and country_name_index < len(row)
                 else "",
                 "subdivision": subdivision,
                 "city": city,
@@ -408,7 +507,6 @@ def _iter_asn_output_rows(asn_path: str):
             if not network:
                 continue
 
-            start_ip, end_ip = _interval_from_network(network)
             asn_value = (
                 row[asn_index].strip()
                 if asn_index is not None and asn_index < len(row)
@@ -420,9 +518,17 @@ def _iter_asn_output_rows(asn_path: str):
                 else ""
             )
 
+            parsed_network = ipaddress.ip_network(network, strict=False)
+            range_start_hex, range_end_hex = _momento_range_hex_for_parsed_network(parsed_network)
             yield {
-                "startip": str(start_ip),
-                "endip": str(end_ip),
+                "momento_score": _momento_score_for_parsed_network(parsed_network),
+                "ip_version": str(parsed_network.version),
+                "shard": _momento_shard_for_parsed_network(parsed_network),
+                "momento_set": _momento_set_for_dataset_and_parsed_network("asn", parsed_network),
+                "sort_key": _momento_sort_key_for_parsed_network(parsed_network),
+                "prefix_len": str(parsed_network.prefixlen),
+                "range_start_hex": range_start_hex,
+                "range_end_hex": range_end_hex,
                 "network": network,
                 "asn": asn_value,
                 "organization": organization_value,
@@ -452,8 +558,6 @@ def _iter_city_output_rows(city_path: str, locations: dict[str, dict[str, str]])
             if not network:
                 continue
 
-            start_ip, end_ip = _interval_from_network(network)
-
             geoname_value = ""
             if geoname_index is not None and geoname_index < len(row):
                 geoname_value = row[geoname_index].strip()
@@ -464,13 +568,21 @@ def _iter_city_output_rows(city_path: str, locations: dict[str, dict[str, str]])
 
             geoname_id = geoname_value or registered_value
             location = locations.get(geoname_id, {})
+            parsed_network = ipaddress.ip_network(network, strict=False)
+            range_start_hex, range_end_hex = _momento_range_hex_for_parsed_network(parsed_network)
 
             yield {
-                "startip": str(start_ip),
-                "endip": str(end_ip),
+                "momento_score": _momento_score_for_parsed_network(parsed_network),
+                "ip_version": str(parsed_network.version),
+                "shard": _momento_shard_for_parsed_network(parsed_network),
+                "momento_set": _momento_set_for_dataset_and_parsed_network("city", parsed_network),
+                "sort_key": _momento_sort_key_for_parsed_network(parsed_network),
+                "prefix_len": str(parsed_network.prefixlen),
+                "range_start_hex": range_start_hex,
+                "range_end_hex": range_end_hex,
                 "network": network,
-                "continent_code": str(location.get("continent_code", "")),
                 "country_iso_code": str(location.get("country_iso_code", "")),
+                "country_name": str(location.get("country_name", "")),
                 "subdivision": str(location.get("subdivision", "")),
                 "city": str(location.get("city", "")),
             }
