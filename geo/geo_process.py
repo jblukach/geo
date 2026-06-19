@@ -104,6 +104,9 @@ class GeoProcessStack(Stack):
                 "MOMENTO_ENDPOINT_SECRET_KEY": "MOMENTO_ENDPOINT",
                 "MOMENTO_ENDPOINT": config.MOMENTO_ENDPOINT,
                 "MOMENTO_SORTED_SET_BATCH_SIZE": str(config.MOMENTO_SORTED_SET_BATCH_SIZE),
+                "MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS": str(
+                    config.MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS
+                ),
                 "MOMENTO_CACHE_NAMES_BY_SOURCE": json.dumps(
                     config.MOMENTO_CACHE_NAMES_BY_SOURCE,
                     sort_keys=True,
@@ -131,6 +134,7 @@ class GeoProcessStack(Stack):
             _event_sources.SqsEventSource(
                 process_queue,
                 batch_size=1,
+                max_concurrency=2,
                 report_batch_item_failures=True,
             )
         )

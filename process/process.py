@@ -27,7 +27,10 @@ MOMENTO_RELEASE_ENV = "MOMENTO_RELEASE"
 MOMENTO_CACHE_NAMES_BY_SOURCE_ENV = "MOMENTO_CACHE_NAMES_BY_SOURCE"
 MOMENTO_CACHE_NAME_ENV = "MOMENTO_CACHE_NAME"
 MOMENTO_SORTED_SET_BATCH_SIZE_ENV = "MOMENTO_SORTED_SET_BATCH_SIZE"
-MOMENTO_SORTED_SET_BATCH_SIZE_DEFAULT = 250
+MOMENTO_SORTED_SET_BATCH_SIZE_DEFAULT = 5000
+MOMENTO_SORTED_SET_REQUEST_SIZE_BYTES = 900 * 1024
+MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV = "MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS"
+MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_DEFAULT = 1.0
 
 ASN_OUTPUT_FIELDS = (
     "momento_score",
@@ -87,6 +90,7 @@ _RUNTIME_STATE = {
     "last_processed_source_signatures": {
         key: "" for key in SOURCE_OUTPUT_CONFIG
     },
+    "last_momento_request_at": 0.0,
 }
 
 
@@ -94,6 +98,7 @@ def reset_runtime_state() -> None:
     _RUNTIME_STATE["last_processed_source_signatures"] = {
         key: "" for key in SOURCE_OUTPUT_CONFIG
     }
+    _RUNTIME_STATE["last_momento_request_at"] = 0.0
 
 
 def _boto3_client(service_name):
@@ -305,13 +310,53 @@ def _momento_put_sorted_set_element(
         raise last_error
 
 
+def _momento_request_min_interval_seconds() -> float:
+    raw_value = os.environ.get(MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV, "").strip()
+    if not raw_value:
+        return MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_DEFAULT
+
+    try:
+        min_interval = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid {MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV}: {raw_value}"
+        ) from exc
+
+    if min_interval < 0:
+        raise RuntimeError(f"{MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV} must be non-negative")
+
+    return min_interval
+
+
+def _momento_wait_for_request_slot() -> None:
+    min_interval = _momento_request_min_interval_seconds()
+    if min_interval <= 0:
+        return
+
+    now = time.monotonic()
+    last_request_at = float(_RUNTIME_STATE.get("last_momento_request_at", 0.0))
+    elapsed = now - last_request_at if last_request_at else min_interval
+    remaining = min_interval - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+
+    _RUNTIME_STATE["last_momento_request_at"] = time.monotonic()
+
+
 def _momento_put_sorted_set_elements(
     client,
     cache_name: str,
     set_name: str,
     elements: dict[str, float],
 ) -> None:
-    response = client.sorted_set_put_elements(cache_name, set_name, elements)
+    try:
+        response = client.sorted_set_put_elements(cache_name, set_name, elements)
+    except Exception as exc:
+        if _momento_is_rate_limit_error(exc):
+            raise RuntimeError(
+                f"Momento sorted_set_put_elements failed for cache {cache_name} set {set_name}: {exc}"
+            ) from exc
+        raise
 
     from momento.responses.data.sorted_set.put_elements import (  # type: ignore[import-not-found]
         CacheSortedSetPutElements,
@@ -321,6 +366,80 @@ def _momento_put_sorted_set_elements(
         raise RuntimeError(
             f"Momento sorted_set_put_elements failed for cache {cache_name} set {set_name}: {response.message}"
         )
+
+
+def _momento_is_rate_limit_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    if "rate limit" in message or "rate-limit" in message:
+        return True
+
+    status_code = getattr(exc, "code", None)
+    if callable(status_code):
+        try:
+            status_code = status_code()
+        except Exception:
+            status_code = None
+
+    status_name = getattr(status_code, "name", "")
+    if str(status_name).upper() == "RESOURCE_EXHAUSTED":
+        return True
+
+    return "resource_exhausted" in message or "resource exhausted" in message
+
+
+def _momento_chunk_sorted_set_elements(elements: dict[str, float]) -> list[dict[str, float]]:
+    chunks: list[dict[str, float]] = []
+    current_chunk: dict[str, float] = {}
+
+    for value, score in elements.items():
+        candidate_chunk = dict(current_chunk)
+        candidate_chunk[value] = score
+        candidate_size = len(
+            json.dumps(candidate_chunk, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        )
+
+        if current_chunk and candidate_size > MOMENTO_SORTED_SET_REQUEST_SIZE_BYTES:
+            chunks.append(current_chunk)
+            current_chunk = {}
+            candidate_chunk = {value: score}
+            candidate_size = len(
+                json.dumps(candidate_chunk, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            )
+
+        current_chunk[value] = score
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+def _momento_is_rate_limit_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "rate limit" in message or "rate-limit" in message
+
+
+def _momento_put_sorted_set_elements_with_retry(
+    client,
+    cache_name: str,
+    set_name: str,
+    elements: dict[str, float],
+) -> None:
+    backoff_seconds = 1.0
+    max_retries = 8
+
+    for chunk in _momento_chunk_sorted_set_elements(elements):
+        for attempt in range(max_retries + 1):
+            try:
+                _momento_wait_for_request_slot()
+                _momento_put_sorted_set_elements(client, cache_name, set_name, chunk)
+                break
+            except RuntimeError as exc:
+                if not _momento_is_rate_limit_error(exc) or attempt == max_retries:
+                    raise
+
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, 30.0)
 
 
 def _momento_value_for_output_row(output_type: str, row: dict[str, str]) -> str:
@@ -450,7 +569,7 @@ def _momento_add_output_rows(
         elements[_momento_value_for_output_row(output_type, row)] = float(row["momento_score"])
 
     for set_name, elements in batch_by_set.items():
-        _momento_put_sorted_set_elements(
+        _momento_put_sorted_set_elements_with_retry(
             momento_context["client"],
             momento_context["cache_name"],
             set_name,

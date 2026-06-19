@@ -823,6 +823,145 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(len(momento_calls[0]["elements"]), 1)
         self.assertIn('"asn":"13335"', next(iter(momento_calls[0]["elements"])))
 
+    def test_momento_bulk_write_retries_on_rate_limit(self):
+        rows = [
+            {
+                "momento_set": "geo:asn:v4:0000",
+                "momento_score": "1",
+                "ip_version": "4",
+                "prefix_len": "31",
+                "range_start_hex": "00000000000000000000000000000000",
+                "range_end_hex": "00000000000000000000000000000001",
+                "network": "1.0.0.0/31",
+                "asn": "13335",
+                "organization": "Cloudflare",
+            }
+        ]
+        writes = []
+
+        def fake_put_sorted_set_elements(client, cache_name, set_name, elements):
+            del client
+            writes.append((cache_name, set_name, dict(elements)))
+            if len(writes) == 1:
+                raise RuntimeError("Momento sorted_set_put_elements failed: Operations rate limit exceeded")
+
+        with mock.patch.object(process, "_momento_put_sorted_set_elements", side_effect=fake_put_sorted_set_elements):
+            with mock.patch.object(process.time, "sleep") as sleep_mock:
+                momento_context = {
+                    "cache_name": "geo",
+                    "client": object(),
+                    "loaded_rows": 0,
+                    "set_names": set(),
+                }
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS": "0"},
+                    clear=False,
+                ):
+                    process._momento_add_output_rows(
+                        momento_context,
+                        "GeoLite2-ASN-Blocks-IPv4.txt",
+                        "asn",
+                        rows,
+                    )
+
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(writes[0][0], "geo")
+        self.assertEqual(writes[0][1], "geo:asn:v4:0000")
+        sleep_mock.assert_called_once_with(1.0)
+        self.assertEqual(momento_context["loaded_rows"], 1)
+        self.assertEqual(momento_context["set_names"], {"geo:asn:v4:0000"})
+
+    def test_momento_put_sorted_set_elements_wraps_raw_resource_exhausted_rpc(self):
+        class ResourceExhaustedError(Exception):
+
+            def code(self):
+                class Status:
+                    name = "RESOURCE_EXHAUSTED"
+
+                return Status()
+
+            def __str__(self):
+                return "RESOURCE_EXHAUSTED: Operations rate limit exceeded"
+
+        class FakeClient:
+
+            def sorted_set_put_elements(self, cache_name, set_name, elements):
+                del cache_name, set_name, elements
+                raise ResourceExhaustedError()
+
+        with self.assertRaisesRegex(RuntimeError, "RESOURCE_EXHAUSTED"):
+            process._momento_put_sorted_set_elements(
+                FakeClient(),
+                "geo",
+                "geo:asn:v4:0000",
+                {"payload": 1.0},
+            )
+
+    def test_momento_bulk_write_chunks_by_request_size(self):
+        rows = []
+        for index in range(4):
+            rows.append(
+                {
+                    "momento_set": "geo:asn:v4:0000",
+                    "momento_score": str(index),
+                    "ip_version": "4",
+                    "prefix_len": "31",
+                    "range_start_hex": "00000000000000000000000000000000",
+                    "range_end_hex": "00000000000000000000000000000001",
+                    "network": f"1.0.0.{index}/31",
+                    "asn": "13335",
+                    "organization": "Cloudflare" + ("x" * 400000 if index % 2 == 0 else ""),
+                }
+            )
+
+        writes = []
+
+        def fake_put_sorted_set_elements(client, cache_name, set_name, elements):
+            del client
+            writes.append((cache_name, set_name, dict(elements)))
+
+        with mock.patch.object(process, "MOMENTO_SORTED_SET_REQUEST_SIZE_BYTES", 1000):
+            with mock.patch.object(process, "_momento_put_sorted_set_elements", side_effect=fake_put_sorted_set_elements):
+                with mock.patch.dict(
+                    os.environ,
+                    {"MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS": "0"},
+                    clear=False,
+                ):
+                    momento_context = {
+                        "cache_name": "geo",
+                        "client": object(),
+                        "loaded_rows": 0,
+                        "set_names": set(),
+                    }
+
+                    process._momento_add_output_rows(
+                        momento_context,
+                        "GeoLite2-ASN-Blocks-IPv4.txt",
+                        "asn",
+                        rows,
+                    )
+
+        self.assertGreater(len(writes), 1)
+        self.assertEqual(momento_context["loaded_rows"], 4)
+        self.assertEqual(momento_context["set_names"], {"geo:asn:v4:0000"})
+
+    def test_momento_request_slot_waits_between_calls(self):
+        with mock.patch.dict(
+            os.environ,
+            {"MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS": "1.5"},
+            clear=False,
+        ):
+            with mock.patch.object(process.time, "monotonic", side_effect=[10.2, 11.7]):
+                with mock.patch.object(process.time, "sleep") as sleep_mock:
+                    process.reset_runtime_state()
+                    process._RUNTIME_STATE["last_momento_request_at"] = 10.0
+                    process._momento_wait_for_request_slot()
+
+                sleep_mock.assert_called_once()
+                self.assertAlmostEqual(sleep_mock.call_args.args[0], 1.3, places=6)
+
     def test_handler_skips_rebuild_until_all_source_files_exist(self):
         uploaded = {}
 
