@@ -1,8 +1,7 @@
 import gzip
+import io
 import json
 import os
-import shutil
-import tempfile
 from datetime import datetime, timezone
 from urllib import parse
 
@@ -23,21 +22,19 @@ DEFAULT_REQUEST_HEADERS = {
 
 STREAM_CHUNK_SIZE = 8 * 1024 * 1024
 BASE_URL = "https://ipinfo.io/data/ipinfo_lite.csv.gz"
+DATASET_NAME = "ipinfo-lite"
+EXTRACTED_FILE_NAME = "ipinfo-lite.csv"
+S3_KEY = "ipinfo-lite.csv"
 
 
-def _build_dataset(token: str) -> dict[str, str]:
+def _build_request_url(token: str) -> str:
     query = parse.urlencode({"_src": "frontend", "token": token})
-
-    return {
-        "name": "ipinfo-lite",
-        "url": f"{BASE_URL}?{query}",
-        "compressed_file": "ipinfo-lite.csv.gz",
-        "extracted_file": "ipinfo-lite.csv",
-        "s3_key": "ipinfo-lite.csv",
-    }
+    return f"{BASE_URL}?{query}"
 
 
-def _download_file(url: str, output_path: str) -> None:
+def _download_content(url: str) -> bytes:
+    content = bytearray()
+
     with requests.get(
         url,
         headers=DEFAULT_REQUEST_HEADERS,
@@ -45,16 +42,16 @@ def _download_file(url: str, output_path: str) -> None:
         stream=True,
     ) as response:
         response.raise_for_status()
-        with open(output_path, "wb") as output:
-            for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
-                if chunk:
-                    output.write(chunk)
+        for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
+            if chunk:
+                content.extend(chunk)
+
+    return bytes(content)
 
 
-def _decompress_gzip(compressed_path: str, extracted_path: str) -> None:
-    with gzip.open(compressed_path, "rb") as source:
-        with open(extracted_path, "wb") as target:
-            shutil.copyfileobj(source, target, STREAM_CHUNK_SIZE)
+def _decompress_gzip_content(compressed_content: bytes) -> bytes:
+    with gzip.GzipFile(fileobj=io.BytesIO(compressed_content), mode="rb") as source:
+        return source.read()
 
 
 def handler(event, context):
@@ -77,31 +74,27 @@ def handler(event, context):
         )
 
     now_utc = datetime.now(timezone.utc)
-    dataset = _build_dataset(token)
+    request_url = _build_request_url(token)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        compressed_path = os.path.join(temp_dir, dataset["compressed_file"])
-        extracted_path = os.path.join(temp_dir, dataset["extracted_file"])
+    try:
+        compressed_content = _download_content(request_url)
+        extracted_content = _decompress_gzip_content(compressed_content)
 
-        try:
-            _download_file(dataset["url"], compressed_path)
-            _decompress_gzip(compressed_path, extracted_path)
+        extracted_files = [EXTRACTED_FILE_NAME]
+        print(f"{DATASET_NAME} extracted files: {json.dumps(extracted_files)}")
 
-            extracted_files = [os.path.basename(extracted_path)]
-            print(f"{dataset['name']} extracted files: {json.dumps(extracted_files)}")
-
-            s3_client.upload_file(extracted_path, download_bucket, dataset["s3_key"])
-        except requests.HTTPError as exc:
-            response = exc.response
-            status_code = response.status_code if response is not None else 0
-            reason = response.reason if response is not None else ""
-            raise RuntimeError(
-                f"Failed processing {dataset['name']} from {dataset['url']}: {status_code} {reason}"
-            ) from exc
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Failed processing {dataset['name']} from {dataset['url']}: {exc}"
-            ) from exc
+        s3_client.put_object(Bucket=download_bucket, Key=S3_KEY, Body=extracted_content)
+    except requests.HTTPError as exc:
+        response = exc.response
+        status_code = response.status_code if response is not None else 0
+        reason = response.reason if response is not None else ""
+        raise RuntimeError(
+            f"Failed processing {DATASET_NAME} from {BASE_URL}: {status_code} {reason}"
+        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Failed processing {DATASET_NAME} from {BASE_URL}: {type(exc).__name__}"
+        ) from exc
 
     return {
         "statusCode": 200,
@@ -111,10 +104,10 @@ def handler(event, context):
                 "cron_utc": CRON_SCHEDULE_UTC,
                 "eventbridge_cron_utc": EVENTBRIDGE_CRON_SCHEDULE_UTC,
                 "dataset": {
-                    "name": dataset["name"],
-                    "url": dataset["url"],
+                    "name": DATASET_NAME,
+                    "url": BASE_URL,
                     "extracted_files": extracted_files,
-                    "s3_key": dataset["s3_key"],
+                    "s3_key": S3_KEY,
                 },
             }
         ),

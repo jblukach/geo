@@ -1,7 +1,6 @@
+import io
 import json
 import os
-import shutil
-import tempfile
 import zipfile
 from datetime import datetime, timezone
 from urllib import parse
@@ -33,66 +32,53 @@ def _build_dataset(token: str, code: str, name: str) -> dict[str, str]:
     return {
         "name": name,
         "code": code,
-        "url": f"{BASE_URL}/?{query}",
-        "archive_name": f"{code}.zip",
-        "extract_dir_name": code,
+        "request_url": f"{BASE_URL}/?{query}",
+        "public_url": f"{BASE_URL}/",
     }
 
 
-def _download_file(url: str, output_path: str) -> None:
+def _download_content(url: str) -> bytes:
+    content = bytearray()
+
     with requests.get(url, timeout=300, stream=True) as response:
         response.raise_for_status()
-        with open(output_path, "wb") as output:
-            for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
-                if chunk:
-                    output.write(chunk)
+        for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
+            if chunk:
+                content.extend(chunk)
+
+    return bytes(content)
 
 
-def _extract_archive(archive_path: str, extract_dir: str) -> list[str]:
-    if os.path.isdir(extract_dir):
-        shutil.rmtree(extract_dir)
-    os.makedirs(extract_dir, exist_ok=True)
+def _extract_and_upload_csv_files(s3_client, bucket_name: str, archive_content: bytes) -> tuple[list[str], list[str]]:
+    uploaded_csv_files: list[str] = []
 
-    if zipfile.is_zipfile(archive_path):
-        with zipfile.ZipFile(archive_path, "r") as zip_file:
-            zip_file.extractall(extract_dir)
+    archive_stream = io.BytesIO(archive_content)
+    if zipfile.is_zipfile(archive_stream):
+        archive_stream.seek(0)
+        with zipfile.ZipFile(archive_stream, "r") as zip_file:
+            file_infos = sorted(
+                [info for info in zip_file.infolist() if not info.is_dir()],
+                key=lambda info: info.filename,
+            )
+            extracted_files = [info.filename for info in file_infos]
+
+            for file_info in file_infos:
+                file_name = os.path.basename(file_info.filename)
+                if not file_name.lower().endswith(".csv"):
+                    continue
+
+                with zip_file.open(file_info, "r") as file_content:
+                    s3_client.upload_fileobj(file_content, bucket_name, file_name)
+                uploaded_csv_files.append(file_name)
     else:
         # Fallback if the upstream sends plain CSV content instead of a zip archive.
-        fallback_csv = os.path.join(extract_dir, "download.csv")
-        shutil.copyfile(archive_path, fallback_csv)
+        fallback_csv = "download.csv"
+        extracted_files = [fallback_csv]
+        s3_client.put_object(Bucket=bucket_name, Key=fallback_csv, Body=archive_content)
+        uploaded_csv_files.append(fallback_csv)
 
-    extracted_files = []
-    for root, _, files in os.walk(extract_dir):
-        for file_name in files:
-            full_path = os.path.join(root, file_name)
-            extracted_files.append(os.path.relpath(full_path, extract_dir))
-
-    extracted_files.sort()
-    return extracted_files
-
-
-def _upload_csv_files(s3_client, bucket_name: str, extract_dir: str, code: str) -> list[str]:
-    uploaded = []
-
-    for root, _, files in os.walk(extract_dir):
-        for file_name in files:
-            if not file_name.lower().endswith(".csv"):
-                continue
-
-            local_path = os.path.join(root, file_name)
-            s3_key = file_name
-            s3_client.upload_file(local_path, bucket_name, s3_key)
-            uploaded.append(s3_key)
-
-    uploaded.sort()
-    return uploaded
-
-
-def _cleanup_path(path: str) -> None:
-    if os.path.isdir(path):
-        shutil.rmtree(path)
-    elif os.path.isfile(path):
-        os.remove(path)
+    uploaded_csv_files.sort()
+    return extracted_files, uploaded_csv_files
 
 
 def handler(event, context):
@@ -120,39 +106,34 @@ def handler(event, context):
     for dataset in DATASETS:
         resolved = _build_dataset(token, dataset["code"], dataset["name"])
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = os.path.join(temp_dir, resolved["archive_name"])
-            extract_dir = os.path.join(temp_dir, resolved["extract_dir_name"])
-
-            try:
-                _download_file(resolved["url"], archive_path)
-                extracted_files = _extract_archive(archive_path, extract_dir)
-                uploaded_csv_files = _upload_csv_files(
-                    s3_client,
-                    download_bucket,
-                    extract_dir,
-                    resolved["code"],
-                )
-            except requests.HTTPError as exc:
-                response = exc.response
-                status_code = response.status_code if response is not None else 0
-                reason = response.reason if response is not None else ""
-                raise RuntimeError(
-                    f"Failed processing {resolved['name']} from {resolved['url']}: {status_code} {reason}"
-                ) from exc
-            except requests.RequestException as exc:
-                raise RuntimeError(
-                    f"Failed processing {resolved['name']} from {resolved['url']}: {exc}"
-                ) from exc
+        try:
+            archive_content = _download_content(resolved["request_url"])
+            extracted_files, uploaded_csv_files = _extract_and_upload_csv_files(
+                s3_client,
+                download_bucket,
+                archive_content,
+            )
+        except requests.HTTPError as exc:
+            response = exc.response
+            status_code = response.status_code if response is not None else 0
+            reason = response.reason if response is not None else ""
+            raise RuntimeError(
+                f"Failed processing {resolved['name']} from {resolved['public_url']}: {status_code} {reason}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Failed processing {resolved['name']} from {resolved['public_url']}: {type(exc).__name__}"
+            ) from exc
 
         print(
-            f"{resolved['name']} extracted files: {json.dumps(extracted_files)} | "
-            f"uploaded_csv_files: {json.dumps(uploaded_csv_files)}"
+            f"{resolved['name']} completed | "
+            f"extracted_file_count={len(extracted_files)} "
+            f"uploaded_csv_count={len(uploaded_csv_files)}"
         )
 
         result[resolved["name"]] = {
             "code": resolved["code"],
-            "url": resolved["url"],
+            "url": resolved["public_url"],
             "extracted_files": extracted_files,
             "uploaded_csv_files": uploaded_csv_files,
         }
