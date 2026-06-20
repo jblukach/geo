@@ -155,6 +155,18 @@ Suggested cutover gates for bulk reader traffic:
 3. p99 latency is 6 seconds or less.
 4. 5xx error rate remains below 0.1%.
 
+Observed baseline (2026-06-20):
+
+1. 300-IP POST requests were stable through concurrency 10.
+2. Concurrency 12 introduced 503 saturation responses.
+3. Re-validate these limits after any major Lambda, networking, or Valkey capacity change.
+
+Lambda concurrency configuration note:
+
+1. Reserved concurrency does not add direct cost, but it consumes account concurrency allocation.
+2. AWS enforces a minimum unreserved concurrency pool; overly high reserved settings can fail deployment.
+3. Keep `SEARCH_LAMBDA_RESERVED_CONCURRENCY` unset by default unless your account quota and unreserved headroom are confirmed.
+
 Suggested additional gates:
 
 1. Search responses include geolite2-asn.csv and geolite2-city.csv timestamps.

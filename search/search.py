@@ -3,6 +3,7 @@ import json
 import os
 import time
 from typing import Any
+from urllib.parse import parse_qs, unquote
 
 
 IP_INPUT_KEYS = ("ip", "ipAddress", "query")
@@ -119,19 +120,39 @@ def _input_ips(event: dict[str, Any]) -> list[str]:
 
     # API Gateway path input, e.g. /geo/134.129.111.111
     path_parameters = event.get("pathParameters") or {}
+    path_parameter_supplied = False
     if isinstance(path_parameters, dict):
+        if path_parameters.get("ip") is not None or path_parameters.get("proxy") is not None:
+            path_parameter_supplied = True
         _append_ip_values(values, path_parameters.get("ip"))
         _append_ip_values(values, path_parameters.get("proxy"))
 
     raw_path = event.get("rawPath")
-    if isinstance(raw_path, str) and raw_path.strip():
+    if not path_parameter_supplied and isinstance(raw_path, str) and raw_path.strip():
         path = raw_path.strip().rstrip("/")
         if "/geo/" in path:
-            _append_ip_values(values, path.rsplit("/", 1)[-1])
+            # API Gateway keeps encoded path text, so decode before parsing as IP.
+            _append_ip_values(values, unquote(path.rsplit("/", 1)[-1]))
+
+    raw_query = event.get("rawQueryString")
+    raw_query_values: dict[str, list[str]] = {}
+    if isinstance(raw_query, str) and raw_query.strip():
+        raw_query_values = parse_qs(raw_query, keep_blank_values=False)
+        for key in IP_INPUT_KEYS:
+            for raw_value in raw_query_values.get(key, []):
+                _append_ip_values(values, raw_value)
+
+    multi_value_query_params = event.get("multiValueQueryStringParameters") or {}
+    if isinstance(multi_value_query_params, dict):
+        for key in IP_INPUT_KEYS:
+            _append_ip_values(values, multi_value_query_params.get(key))
 
     query_params = event.get("queryStringParameters") or {}
     if isinstance(query_params, dict):
         for key in IP_INPUT_KEYS:
+            if key in raw_query_values:
+                # rawQueryString preserves repeated keys, so prefer it when available.
+                continue
             _append_ip_values(values, query_params.get(key))
 
     for key in IP_INPUT_KEYS:
@@ -262,7 +283,7 @@ def _response(status_code: int, payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "statusCode": status_code,
         "headers": {"content-type": "application/json"},
-        "body": json.dumps(payload, separators=(",", ":")),
+        "body": json.dumps(payload, indent=4),
     }
 
 
@@ -482,11 +503,16 @@ def handler(event, context):
         durationMs=duration_ms,
     )
 
-    return _response(
-        200,
-        {
-            **metadata,
-            "results": results,
-            "requested_count": len(input_ips),
-        },
-    )
+    response_payload: dict[str, Any] = {
+        "results": results,
+        "requested_count": len(input_ips),
+    }
+
+    if "attribution" in metadata:
+        response_payload["attribution"] = metadata["attribution"]
+    if "geolite2-asn.csv" in metadata:
+        response_payload["geolite2-asn.csv"] = metadata["geolite2-asn.csv"]
+    if "geolite2-city.csv" in metadata:
+        response_payload["geolite2-city.csv"] = metadata["geolite2-city.csv"]
+
+    return _response(200, response_payload)

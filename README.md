@@ -141,6 +141,28 @@ Suggested service goals:
 | p99 latency | <= 6.0s |
 | Error rate (5xx) | < 0.1% |
 
+## Production readiness checklist
+
+Before promoting `geo-search` changes, verify:
+
+1. Input-path unit tests pass for query/body/path inputs, URL-encoded IPv6 path segments, and invalid IP handling.
+2. Exact-limit bulk request test passes for `MAX_IPS_PER_REQUEST=300`.
+3. Load-test results are captured for 300-IP POST requests at target concurrency.
+4. 2xx success rate, p95, p99, and 5xx error rate are within service goals.
+5. Response includes expected metadata fields (`attribution`, `geolite2-asn.csv`, `geolite2-city.csv`).
+
+Current validated baseline (2026-06-20, production endpoint):
+
+1. 300-IP POST at concurrency 10: 100% success, p95 about 1.40s, p99 about 1.46s.
+2. 300-IP POST at concurrency 12: saturation observed (503 responses).
+3. Practical starting envelope: keep sustained bulk traffic at or below concurrency 10 unless new load tests prove otherwise.
+
+Deployment tuning notes:
+
+1. Search Lambda memory is set to 1024 MB (`SEARCH_LAMBDA_MEMORY_SIZE_MB`).
+2. Reserved concurrency is optional (`SEARCH_LAMBDA_RESERVED_CONCURRENCY`). Default is unset to avoid account-level unreserved concurrency floor conflicts.
+3. If you set reserved concurrency, ensure the account retains the required unreserved minimum before deploying.
+
 ## Security model
 
 1. Process and search run in private isolated subnets.

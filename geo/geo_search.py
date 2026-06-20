@@ -42,21 +42,18 @@ class GeoSearchStack(Stack):
             compatible_architectures=[_lambda.Architecture.ARM_64],
         )
 
-        search = _lambda.Function(
-            self,
-            "search",
-            function_name="geo-search",
-            runtime=_lambda.Runtime.PYTHON_3_13,
-            architecture=_lambda.Architecture.ARM_64,
-            code=_lambda.Code.from_asset("search"),
-            handler="search.handler",
-            timeout=Duration.seconds(30),
-            memory_size=512,
-            vpc=vpc,
-            vpc_subnets=_ec2.SubnetSelection(subnet_type=_ec2.SubnetType.PRIVATE_ISOLATED),
-            security_groups=[process_security_group],
-            layers=[redis_layer],
-            environment={
+        function_kwargs = {
+            "runtime": _lambda.Runtime.PYTHON_3_13,
+            "architecture": _lambda.Architecture.ARM_64,
+            "code": _lambda.Code.from_asset("search"),
+            "handler": "search.handler",
+            "timeout": Duration.seconds(30),
+            "memory_size": config.SEARCH_LAMBDA_MEMORY_SIZE_MB,
+            "vpc": vpc,
+            "vpc_subnets": _ec2.SubnetSelection(subnet_type=_ec2.SubnetType.PRIVATE_ISOLATED),
+            "security_groups": [process_security_group],
+            "layers": [redis_layer],
+            "environment": {
                 "VALKEY_ENDPOINT": valkey_endpoint,
                 "VALKEY_PORT": valkey_port,
                 "VALKEY_TLS": str(config.VALKEY_TLS).lower(),
@@ -70,6 +67,16 @@ class GeoSearchStack(Stack):
                 "MAX_REQUEST_BODY_BYTES": str(config.SEARCH_MAX_REQUEST_BODY_BYTES),
                 "MIN_REMAINING_TIME_MS": str(config.SEARCH_MIN_REMAINING_TIME_MS),
             },
+        }
+
+        if isinstance(config.SEARCH_LAMBDA_RESERVED_CONCURRENCY, int) and config.SEARCH_LAMBDA_RESERVED_CONCURRENCY > 0:
+            function_kwargs["reserved_concurrent_executions"] = config.SEARCH_LAMBDA_RESERVED_CONCURRENCY
+
+        search = _lambda.Function(
+            self,
+            "search",
+            function_name="geo-search",
+            **function_kwargs,
         )
 
         apigateway = _ssm.StringParameter.from_string_parameter_attributes(
