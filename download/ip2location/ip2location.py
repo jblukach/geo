@@ -126,7 +126,7 @@ def handler(event, context):
             ) from exc
 
         print(
-            f"{resolved['name']} completed | "
+            f"{dataset['name']} ({dataset['code']}) completed | "
             f"extracted_file_count={len(extracted_files)} "
             f"uploaded_csv_count={len(uploaded_csv_files)}"
         )
