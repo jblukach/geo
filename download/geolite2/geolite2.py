@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import tempfile
 import zipfile
 
 import boto3  # type: ignore[import-not-found]
@@ -138,29 +139,27 @@ def handler(event, context):
             result[dataset["name"]] = []
             continue
 
-        zip_path = f"/tmp/{dataset['name']}.zip"
-        extract_dir = f"/tmp/{dataset['name']}"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = os.path.join(temp_dir, f"{dataset['name']}.zip")
+            extract_dir = os.path.join(temp_dir, dataset["name"])
 
-        try:
-            with requests.get(
-                dataset["url"],
-                auth=auth,
-                timeout=300,
-                stream=True,
-            ) as get_response:
-                get_response.raise_for_status()
-                with open(zip_path, "wb") as output:
-                    for chunk in get_response.iter_content(chunk_size=8 * 1024 * 1024):
-                        if chunk:
-                            output.write(chunk)
+            try:
+                with requests.get(
+                    dataset["url"],
+                    auth=auth,
+                    timeout=300,
+                    stream=True,
+                ) as get_response:
+                    get_response.raise_for_status()
+                    with open(zip_path, "wb") as output:
+                        for chunk in get_response.iter_content(chunk_size=8 * 1024 * 1024):
+                            if chunk:
+                                output.write(chunk)
 
-            extracted_files = _extract_and_list(zip_path, extract_dir)
-            _upload_files(s3_client, download_bucket, extract_dir, dataset["files"])
-        except requests.RequestException as exc:
-            raise RuntimeError(f"Failed download for {dataset['name']}: {exc}") from exc
-        finally:
-            _cleanup_path(zip_path)
-            _cleanup_path(extract_dir)
+                extracted_files = _extract_and_list(zip_path, extract_dir)
+                _upload_files(s3_client, download_bucket, extract_dir, dataset["files"])
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Failed download for {dataset['name']}: {exc}") from exc
 
         print(f"{dataset['name']} extracted files: {json.dumps(extracted_files)}")
 

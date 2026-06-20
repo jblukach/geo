@@ -2,6 +2,7 @@ import gzip
 import json
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
 
 import boto3  # type: ignore[import-not-found]
@@ -29,15 +30,15 @@ def _build_datasets(now_utc: datetime) -> list[dict[str, str]]:
         {
             "name": "dbip-city-lite",
             "url": f"https://download.db-ip.com/free/dbip-city-lite-{year_month}.csv.gz",
-            "compressed_file": f"/tmp/dbip-city-lite-{year_month}.csv.gz",
-            "extracted_file": f"/tmp/dbip-city-lite-{year_month}.csv",
+            "compressed_file": f"dbip-city-lite-{year_month}.csv.gz",
+            "extracted_file": f"dbip-city-lite-{year_month}.csv",
             "s3_key": "dbip-city-lite.csv",
         },
         {
             "name": "dbip-asn-lite",
             "url": f"https://download.db-ip.com/free/dbip-asn-lite-{year_month}.csv.gz",
-            "compressed_file": f"/tmp/dbip-asn-lite-{year_month}.csv.gz",
-            "extracted_file": f"/tmp/dbip-asn-lite-{year_month}.csv",
+            "compressed_file": f"dbip-asn-lite-{year_month}.csv.gz",
+            "extracted_file": f"dbip-asn-lite-{year_month}.csv",
             "s3_key": "dbip-asn-lite.csv",
         },
     ]
@@ -63,11 +64,6 @@ def _decompress_gzip(compressed_path: str, extracted_path: str) -> None:
             shutil.copyfileobj(source, target, STREAM_CHUNK_SIZE)
 
 
-def _cleanup(path: str) -> None:
-    if os.path.isfile(path):
-        os.remove(path)
-
-
 def handler(event, context):
     del event, context
 
@@ -79,44 +75,42 @@ def handler(event, context):
 
     result = {}
 
-    for dataset in datasets:
-        compressed_path = dataset["compressed_file"]
-        extracted_path = dataset["extracted_file"]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for dataset in datasets:
+            compressed_path = os.path.join(temp_dir, dataset["compressed_file"])
+            extracted_path = os.path.join(temp_dir, dataset["extracted_file"])
 
-        try:
-            _download_file(dataset["url"], compressed_path)
-            _decompress_gzip(compressed_path, extracted_path)
+            try:
+                _download_file(dataset["url"], compressed_path)
+                _decompress_gzip(compressed_path, extracted_path)
 
-            # List extracted files before any upload.
-            extracted_files = [os.path.basename(extracted_path)]
-            print(f"{dataset['name']} extracted files: {json.dumps(extracted_files)}")
+                # List extracted files before any upload.
+                extracted_files = [os.path.basename(extracted_path)]
+                print(f"{dataset['name']} extracted files: {json.dumps(extracted_files)}")
 
-            s3_client.upload_file(extracted_path, download_bucket, dataset["s3_key"])
-        except requests.HTTPError as exc:
-            response = exc.response
-            status_code = response.status_code if response is not None else 0
-            reason = response.reason if response is not None else ""
-            if status_code == 403:
+                s3_client.upload_file(extracted_path, download_bucket, dataset["s3_key"])
+            except requests.HTTPError as exc:
+                response = exc.response
+                status_code = response.status_code if response is not None else 0
+                reason = response.reason if response is not None else ""
+                if status_code == 403:
+                    raise RuntimeError(
+                        f"Failed processing {dataset['name']} from {dataset['url']}: 403 Forbidden. "
+                        "The request used standard browser-like headers, so this is likely source IP policy/rate limiting from the upstream provider. "
+                        "Use a static egress IP (NAT + EIP) and request allowlisting with DB-IP, or proxy through an allowed network."
+                    ) from exc
                 raise RuntimeError(
-                    f"Failed processing {dataset['name']} from {dataset['url']}: 403 Forbidden. "
-                    "The request used standard browser-like headers, so this is likely source IP policy/rate limiting from the upstream provider. "
-                    "Use a static egress IP (NAT + EIP) and request allowlisting with DB-IP, or proxy through an allowed network."
+                    f"Failed processing {dataset['name']} from {dataset['url']}: {status_code} {reason}"
                 ) from exc
-            raise RuntimeError(
-                f"Failed processing {dataset['name']} from {dataset['url']}: {status_code} {reason}"
-            ) from exc
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Failed processing {dataset['name']} from {dataset['url']}: {exc}"
-            ) from exc
-        finally:
-            _cleanup(compressed_path)
-            _cleanup(extracted_path)
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Failed processing {dataset['name']} from {dataset['url']}: {exc}"
+                ) from exc
 
-        result[dataset["name"]] = {
-            "url": dataset["url"],
-            "extracted_files": extracted_files,
-        }
+            result[dataset["name"]] = {
+                "url": dataset["url"],
+                "extracted_files": extracted_files,
+            }
 
     return {
         "statusCode": 200,

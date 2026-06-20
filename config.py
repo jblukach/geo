@@ -1,10 +1,14 @@
-MOMENTO_ENDPOINT = "cell-1-us-east-2-1.prod.a.momentohq.com"
-MOMENTO_SORTED_SET_BATCH_SIZE = 5000
-MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS = 1.0
-
-MOMENTO_CACHE_NAMES_BY_SOURCE = {
-    "GeoLite2-ASN-Blocks-IPv4.csv": "GeoLite2-ASN-Blocks-IPv4",
-    "GeoLite2-ASN-Blocks-IPv6.csv": "GeoLite2-ASN-Blocks-IPv6",
-    "GeoLite2-City-Blocks-IPv4.csv": "GeoLite2-City-Blocks-IPv4",
-    "GeoLite2-City-Blocks-IPv6.csv": "GeoLite2-City-Blocks-IPv6",
-}
+VALKEY_ENDPOINT = ""
+VALKEY_PORT = 6379
+VALKEY_SORTED_SET_BATCH_SIZE = 5000
+VALKEY_TLS = True
+VALKEY_ASN_V4_SET_NAME = "asn_v4_ranges"
+VALKEY_ASN_V6_SET_NAME = "asn_v6_ranges"
+VALKEY_CITY_V4_SET_NAME = "city_v4_ranges"
+VALKEY_CITY_V6_SET_NAME = "city_v6_ranges"
+VALKEY_LAST_UPDATED_ASN_KEY = "geo:last_updated:asn"
+VALKEY_LAST_UPDATED_CITY_KEY = "geo:last_updated:city"
+VALKEY_MAX_CONNECTIONS = 8
+SEARCH_MAX_IPS_PER_REQUEST = 300
+SEARCH_MAX_REQUEST_BODY_BYTES = 262144
+SEARCH_MIN_REMAINING_TIME_MS = 1500

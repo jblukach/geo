@@ -2,6 +2,7 @@ import gzip
 import json
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
 from urllib import parse
 
@@ -30,8 +31,8 @@ def _build_dataset(token: str) -> dict[str, str]:
     return {
         "name": "ipinfo-lite",
         "url": f"{BASE_URL}?{query}",
-        "compressed_file": "/tmp/ipinfo-lite.csv.gz",
-        "extracted_file": "/tmp/ipinfo-lite.csv",
+        "compressed_file": "ipinfo-lite.csv.gz",
+        "extracted_file": "ipinfo-lite.csv",
         "s3_key": "ipinfo-lite.csv",
     }
 
@@ -56,11 +57,6 @@ def _decompress_gzip(compressed_path: str, extracted_path: str) -> None:
             shutil.copyfileobj(source, target, STREAM_CHUNK_SIZE)
 
 
-def _cleanup(path: str) -> None:
-    if os.path.isfile(path):
-        os.remove(path)
-
-
 def handler(event, context):
     del event, context
 
@@ -83,31 +79,29 @@ def handler(event, context):
     now_utc = datetime.now(timezone.utc)
     dataset = _build_dataset(token)
 
-    compressed_path = dataset["compressed_file"]
-    extracted_path = dataset["extracted_file"]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        compressed_path = os.path.join(temp_dir, dataset["compressed_file"])
+        extracted_path = os.path.join(temp_dir, dataset["extracted_file"])
 
-    try:
-        _download_file(dataset["url"], compressed_path)
-        _decompress_gzip(compressed_path, extracted_path)
+        try:
+            _download_file(dataset["url"], compressed_path)
+            _decompress_gzip(compressed_path, extracted_path)
 
-        extracted_files = [os.path.basename(extracted_path)]
-        print(f"{dataset['name']} extracted files: {json.dumps(extracted_files)}")
+            extracted_files = [os.path.basename(extracted_path)]
+            print(f"{dataset['name']} extracted files: {json.dumps(extracted_files)}")
 
-        s3_client.upload_file(extracted_path, download_bucket, dataset["s3_key"])
-    except requests.HTTPError as exc:
-        response = exc.response
-        status_code = response.status_code if response is not None else 0
-        reason = response.reason if response is not None else ""
-        raise RuntimeError(
-            f"Failed processing {dataset['name']} from {dataset['url']}: {status_code} {reason}"
-        ) from exc
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"Failed processing {dataset['name']} from {dataset['url']}: {exc}"
-        ) from exc
-    finally:
-        _cleanup(compressed_path)
-        _cleanup(extracted_path)
+            s3_client.upload_file(extracted_path, download_bucket, dataset["s3_key"])
+        except requests.HTTPError as exc:
+            response = exc.response
+            status_code = response.status_code if response is not None else 0
+            reason = response.reason if response is not None else ""
+            raise RuntimeError(
+                f"Failed processing {dataset['name']} from {dataset['url']}: {status_code} {reason}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Failed processing {dataset['name']} from {dataset['url']}: {exc}"
+            ) from exc
 
     return {
         "statusCode": 200,

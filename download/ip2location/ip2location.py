@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from urllib import parse
@@ -33,8 +34,8 @@ def _build_dataset(token: str, code: str, name: str) -> dict[str, str]:
         "name": name,
         "code": code,
         "url": f"{BASE_URL}/?{query}",
-        "archive_path": f"/tmp/{code}.zip",
-        "extract_dir": f"/tmp/{code}",
+        "archive_name": f"{code}.zip",
+        "extract_dir_name": code,
     }
 
 
@@ -118,32 +119,31 @@ def handler(event, context):
 
     for dataset in DATASETS:
         resolved = _build_dataset(token, dataset["code"], dataset["name"])
-        archive_path = resolved["archive_path"]
-        extract_dir = resolved["extract_dir"]
 
-        try:
-            _download_file(resolved["url"], archive_path)
-            extracted_files = _extract_archive(archive_path, extract_dir)
-            uploaded_csv_files = _upload_csv_files(
-                s3_client,
-                download_bucket,
-                extract_dir,
-                resolved["code"],
-            )
-        except requests.HTTPError as exc:
-            response = exc.response
-            status_code = response.status_code if response is not None else 0
-            reason = response.reason if response is not None else ""
-            raise RuntimeError(
-                f"Failed processing {resolved['name']} from {resolved['url']}: {status_code} {reason}"
-            ) from exc
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Failed processing {resolved['name']} from {resolved['url']}: {exc}"
-            ) from exc
-        finally:
-            _cleanup_path(archive_path)
-            _cleanup_path(extract_dir)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = os.path.join(temp_dir, resolved["archive_name"])
+            extract_dir = os.path.join(temp_dir, resolved["extract_dir_name"])
+
+            try:
+                _download_file(resolved["url"], archive_path)
+                extracted_files = _extract_archive(archive_path, extract_dir)
+                uploaded_csv_files = _upload_csv_files(
+                    s3_client,
+                    download_bucket,
+                    extract_dir,
+                    resolved["code"],
+                )
+            except requests.HTTPError as exc:
+                response = exc.response
+                status_code = response.status_code if response is not None else 0
+                reason = response.reason if response is not None else ""
+                raise RuntimeError(
+                    f"Failed processing {resolved['name']} from {resolved['url']}: {status_code} {reason}"
+                ) from exc
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Failed processing {resolved['name']} from {resolved['url']}: {exc}"
+                ) from exc
 
         print(
             f"{resolved['name']} extracted files: {json.dumps(extracted_files)} | "

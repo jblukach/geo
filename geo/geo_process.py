@@ -1,14 +1,11 @@
-import json
-import os
-
 from aws_cdk import Duration, RemovalPolicy, Size, Stack
+from aws_cdk import aws_ec2 as _ec2
 from aws_cdk import aws_events as _events
 from aws_cdk import aws_events_targets as _targets
 from aws_cdk import aws_lambda as _lambda
 from aws_cdk import aws_lambda_event_sources as _event_sources
 from aws_cdk import aws_logs as _logs
 from aws_cdk import aws_s3 as _s3
-from aws_cdk import aws_secretsmanager as _secrets
 from aws_cdk import aws_sqs as _sqs
 from constructs import Construct
 
@@ -23,6 +20,10 @@ class GeoProcessStack(Stack):
         construct_id: str,
         download_bucket_name: str,
         processed_bucket_name: str,
+        vpc: _ec2.IVpc,
+        process_security_group: _ec2.ISecurityGroup,
+        valkey_endpoint: str,
+        valkey_port: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -65,22 +66,16 @@ class GeoProcessStack(Stack):
             bucket_name="packages-use2-lukach-io",
         )
 
-        momento_layer = _lambda.LayerVersion(
+        redis_layer = _lambda.LayerVersion(
             self,
-            "momentolayer",
-            layer_version_name="momento",
+            "redislayer",
+            layer_version_name="redis",
             code=_lambda.Code.from_bucket(
                 bucket=package_bucket,
-                key="momento.zip",
+                key="redis.zip",
             ),
             compatible_runtimes=[_lambda.Runtime.PYTHON_3_13],
             compatible_architectures=[_lambda.Architecture.ARM_64],
-        )
-
-        credentials_secret = _secrets.Secret.from_secret_name_v2(
-            self,
-            "processcredentialssecret",
-            secret_name="credentials",
         )
 
         process = _lambda.Function(
@@ -94,25 +89,25 @@ class GeoProcessStack(Stack):
             ephemeral_storage_size=Size.gibibytes(3),
             timeout=Duration.seconds(900),
             memory_size=3008,
-            layers=[momento_layer],
+            vpc=vpc,
+            vpc_subnets=_ec2.SubnetSelection(subnet_type=_ec2.SubnetType.PRIVATE_ISOLATED),
+            security_groups=[process_security_group],
+            layers=[redis_layer],
             environment={
                 "DOWNLOAD_BUCKET_NAME": download_bucket.bucket_name,
                 "PROCESSED_BUCKET_NAME": processed_bucket_name,
                 "PROCESS_QUEUE_URL": process_queue.queue_url,
-                "MOMENTO_SECRET_NAME": "credentials",
-                "MOMENTO_SECRET_KEY": "MOMENTO",
-                "MOMENTO_ENDPOINT_SECRET_KEY": "MOMENTO_ENDPOINT",
-                "MOMENTO_ENDPOINT": config.MOMENTO_ENDPOINT,
-                "MOMENTO_SORTED_SET_BATCH_SIZE": str(config.MOMENTO_SORTED_SET_BATCH_SIZE),
-                "MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS": str(
-                    config.MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS
-                ),
-                "MOMENTO_CACHE_NAMES_BY_SOURCE": json.dumps(
-                    config.MOMENTO_CACHE_NAMES_BY_SOURCE,
-                    sort_keys=True,
-                ),
-                "MOMENTO_SET_PREFIX": "geo",
-                "MOMENTO_RELEASE": os.getenv("MOMENTO_RELEASE", ""),
+                "VALKEY_ENDPOINT": valkey_endpoint,
+                "VALKEY_PORT": valkey_port,
+                "VALKEY_TLS": str(config.VALKEY_TLS).lower(),
+                "VALKEY_SORTED_SET_BATCH_SIZE": str(config.VALKEY_SORTED_SET_BATCH_SIZE),
+                "VALKEY_ASN_V4_SET_NAME": config.VALKEY_ASN_V4_SET_NAME,
+                "VALKEY_ASN_V6_SET_NAME": config.VALKEY_ASN_V6_SET_NAME,
+                "VALKEY_CITY_V4_SET_NAME": config.VALKEY_CITY_V4_SET_NAME,
+                "VALKEY_CITY_V6_SET_NAME": config.VALKEY_CITY_V6_SET_NAME,
+                "VALKEY_LAST_UPDATED_ASN_KEY": config.VALKEY_LAST_UPDATED_ASN_KEY,
+                "VALKEY_LAST_UPDATED_CITY_KEY": config.VALKEY_LAST_UPDATED_CITY_KEY,
+                "VALKEY_MAX_CONNECTIONS": str(config.VALKEY_MAX_CONNECTIONS),
             },
         )
 
@@ -128,7 +123,6 @@ class GeoProcessStack(Stack):
         processed_bucket.grant_put(process)
         process_queue.grant_consume_messages(process)
         process_queue.grant_send_messages(process)
-        credentials_secret.grant_read(process)
 
         process.add_event_source(
             _event_sources.SqsEventSource(

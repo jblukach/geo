@@ -37,14 +37,14 @@ class GeoLayer(Construct):
             compatible_architectures=[_lambda.Architecture.ARM_64],
         )
 
-        self.momento_layer = _lambda.LayerVersion(
+        self.redis_layer = _lambda.LayerVersion(
             self,
-            'momento',
-            layer_version_name='momento',
+            'redis',
+            layer_version_name='redis',
             description=str(year) + '-' + str(month) + '-' + str(day) + ' deployment',
             code=_lambda.Code.from_bucket(
                 bucket=bucket,
-                key='momento.zip',
+                key='redis.zip',
             ),
             compatible_runtimes=[_lambda.Runtime.PYTHON_3_13],
             compatible_architectures=[_lambda.Architecture.ARM_64],

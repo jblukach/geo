@@ -3,10 +3,11 @@ import io
 import ipaddress
 import json
 import os
+import asyncio
+import datetime
 import tempfile
 import time
 import urllib.parse
-from datetime import timedelta
 from typing import Any
 
 _S3_MULTIPART_CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB (S3 minimum part size is 5 MB)
@@ -20,23 +21,31 @@ TRIGGER_SOURCE_FILES = {
 }
 
 JOB_TYPE_SOURCE_BUILD = "source_build"
-MOMENTO_SET_PREFIX = "geo"
-MOMENTO_SECRET_KEY_DEFAULT = "MOMENTO"
-MOMENTO_ENDPOINT_SECRET_KEY_DEFAULT = "MOMENTO_ENDPOINT"
-MOMENTO_RELEASE_ENV = "MOMENTO_RELEASE"
-MOMENTO_CACHE_NAMES_BY_SOURCE_ENV = "MOMENTO_CACHE_NAMES_BY_SOURCE"
-MOMENTO_CACHE_NAME_ENV = "MOMENTO_CACHE_NAME"
-MOMENTO_SORTED_SET_BATCH_SIZE_ENV = "MOMENTO_SORTED_SET_BATCH_SIZE"
-MOMENTO_SORTED_SET_BATCH_SIZE_DEFAULT = 5000
-MOMENTO_SORTED_SET_REQUEST_SIZE_BYTES = 900 * 1024
-MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV = "MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS"
-MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_DEFAULT = 1.0
+VALKEY_SORTED_SET_BATCH_SIZE_ENV = "VALKEY_SORTED_SET_BATCH_SIZE"
+VALKEY_SORTED_SET_BATCH_SIZE_DEFAULT = 5000
+VALKEY_ASN_V4_SET_NAME_ENV = "VALKEY_ASN_V4_SET_NAME"
+VALKEY_ASN_V6_SET_NAME_ENV = "VALKEY_ASN_V6_SET_NAME"
+VALKEY_CITY_V4_SET_NAME_ENV = "VALKEY_CITY_V4_SET_NAME"
+VALKEY_CITY_V6_SET_NAME_ENV = "VALKEY_CITY_V6_SET_NAME"
+VALKEY_ASN_V4_SET_NAME_DEFAULT = "asn_v4_ranges"
+VALKEY_ASN_V6_SET_NAME_DEFAULT = "asn_v6_ranges"
+VALKEY_CITY_V4_SET_NAME_DEFAULT = "city_v4_ranges"
+VALKEY_CITY_V6_SET_NAME_DEFAULT = "city_v6_ranges"
+VALKEY_LAST_UPDATED_ASN_KEY_ENV = "VALKEY_LAST_UPDATED_ASN_KEY"
+VALKEY_LAST_UPDATED_CITY_KEY_ENV = "VALKEY_LAST_UPDATED_CITY_KEY"
+VALKEY_LAST_UPDATED_ASN_KEY_DEFAULT = "geo:last_updated:asn"
+VALKEY_LAST_UPDATED_CITY_KEY_DEFAULT = "geo:last_updated:city"
+VALKEY_PORT_ENV = "VALKEY_PORT"
+VALKEY_PORT_DEFAULT = 6379
+VALKEY_TLS_ENV = "VALKEY_TLS"
+VALKEY_MAX_CONNECTIONS_ENV = "VALKEY_MAX_CONNECTIONS"
+VALKEY_MAX_CONNECTIONS_DEFAULT = 8
 
 ASN_OUTPUT_FIELDS = (
-    "momento_score",
+    "range_start_int",
     "ip_version",
     "shard",
-    "momento_set",
+    "set_name",
     "sort_key",
     "prefix_len",
     "range_start_hex",
@@ -47,10 +56,10 @@ ASN_OUTPUT_FIELDS = (
 )
 
 CITY_OUTPUT_FIELDS = (
-    "momento_score",
+    "range_start_int",
     "ip_version",
     "shard",
-    "momento_set",
+    "set_name",
     "sort_key",
     "prefix_len",
     "range_start_hex",
@@ -81,7 +90,7 @@ SOURCE_OUTPUT_CONFIG = {
     },
 }
 
-MOMENTO_SOURCE_OUTPUTS = {
+VALKEY_SOURCE_OUTPUTS = {
     config["output"] for config in SOURCE_OUTPUT_CONFIG.values()
 }
 
@@ -90,7 +99,6 @@ _RUNTIME_STATE = {
     "last_processed_source_signatures": {
         key: "" for key in SOURCE_OUTPUT_CONFIG
     },
-    "last_momento_request_at": 0.0,
 }
 
 
@@ -98,7 +106,6 @@ def reset_runtime_state() -> None:
     _RUNTIME_STATE["last_processed_source_signatures"] = {
         key: "" for key in SOURCE_OUTPUT_CONFIG
     }
-    _RUNTIME_STATE["last_momento_request_at"] = 0.0
 
 
 def _boto3_client(service_name):
@@ -113,566 +120,268 @@ def _log_event(event_name: str, **fields) -> None:
     print(json.dumps(payload, sort_keys=True))
 
 
-def _momento_set_prefix() -> str:
-    prefix = os.environ.get("MOMENTO_SET_PREFIX", MOMENTO_SET_PREFIX).strip() or MOMENTO_SET_PREFIX
-    release = os.environ.get(MOMENTO_RELEASE_ENV, "").strip()
-    if not release:
-        return prefix
-    return f"{prefix}:{release}"
+def _is_truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _secret_string_value(secret_name: str) -> str:
-    secrets_client = _boto3_client("secretsmanager")
-    response = secrets_client.get_secret_value(SecretId=secret_name)
-    return str(response.get("SecretString", ""))
-
-
-def _momento_token_from_secret(secret_name: str, secret_key: str) -> str:
-    secret_string = _secret_string_value(secret_name)
-    if not secret_string:
-        return ""
-
-    try:
-        secret_payload = json.loads(secret_string)
-    except json.JSONDecodeError:
-        # Support plain-string secret values when the secret is not a JSON object.
-        return secret_string
-
-    value = secret_payload.get(secret_key)
-    if value is None:
-        return ""
-    return str(value)
-
-
-def _momento_endpoint_from_secret(secret_name: str, secret_key: str) -> str:
-    secret_string = _secret_string_value(secret_name)
-    if not secret_string:
-        return ""
-
-    try:
-        secret_payload = json.loads(secret_string)
-    except json.JSONDecodeError:
-        return ""
-
-    value = secret_payload.get(secret_key)
-    if value is None:
-        for fallback_key in ("MOMENTO_ENDPOINT", "endpoint", "momento_endpoint"):
-            value = secret_payload.get(fallback_key)
-            if value is not None:
-                break
-
-    if value is None:
-        return ""
-    return str(value)
-
-
-def _momento_configuration(configurations):
-    for provider_name in ("InRegion", "Laptop", "Lambda"):
-        provider = getattr(configurations, provider_name, None)
-        if provider is None:
-            continue
-        for selector_name in ("latest", "v1"):
-            selector = getattr(provider, selector_name, None)
-            if selector is None:
-                continue
-            try:
-                return selector()
-            except TypeError:
-                continue
-    return None
-
-
-def _momento_normalize_endpoint(endpoint: str) -> str:
+def _normalize_endpoint(endpoint: str) -> str:
     value = endpoint.strip()
     if not value:
         return ""
 
     if "://" in value:
-        parsed = urllib.parse.urlparse(value)
-        value = parsed.netloc or parsed.path
+        value = value.split("://", 1)[1]
 
     value = value.split("/", 1)[0]
-    if value.endswith(":443"):
-        value = value[:-4]
-
-    for prefix in ("control.", "cache.", "token."):
-        if value.startswith(prefix):
-            return value[len(prefix):]
-
     return value
 
 
-def _momento_credential_provider(credential_provider, auth_token: str, endpoint: str = ""):
-    from_string = getattr(credential_provider, "from_string", None)
-    fallback_error: BaseException | None = None
-
-    if from_string is not None:
-        try:
-            return from_string(auth_token)
-        except TypeError as exc:
-            fallback_error = exc
-        except Exception as exc:  # pragma: no cover - depends on Momento SDK internals
-            message = str(exc).lower()
-            if "v2 api key" not in message:
-                raise
-            fallback_error = exc
-
-    normalized_endpoint = _momento_normalize_endpoint(endpoint)
-
-    from_api_key_v2 = getattr(credential_provider, "from_api_key_v2", None)
-    if from_api_key_v2 is not None:
-        if not normalized_endpoint:
-            raise RuntimeError(
-                "Momento v2 API key requires MOMENTO_ENDPOINT (or MOMENTO_ENDPOINT value in secret)."
-            )
-        try:
-            return from_api_key_v2(auth_token, normalized_endpoint)
-        except TypeError as exc:
-            fallback_error = exc
-
-    for method_name in (
-        "from_disposable_token",
-        "from_api_key",
-        "from_api_key_string",
-    ):
-        method = getattr(credential_provider, method_name, None)
-        if method is None:
-            continue
-        try:
-            return method(auth_token)
-        except TypeError as exc:
-            fallback_error = exc
-            continue
-
-    if fallback_error is not None:
-        raise fallback_error
-
-    raise RuntimeError("No supported Momento credential provider method found")
+def _valkey_endpoint() -> str:
+    endpoint = os.environ.get("VALKEY_ENDPOINT", "").strip()
+    return _normalize_endpoint(endpoint)
 
 
-def _momento_cache_client(auth_token: str, endpoint: str = ""):
-    from momento import CacheClient, Configurations, CredentialProvider  # type: ignore[import-not-found]
-
-    configuration = _momento_configuration(Configurations)
-    kwargs: dict[str, Any] = {
-        "credential_provider": _momento_credential_provider(CredentialProvider, auth_token, endpoint),
-    }
-
-    if configuration is not None:
-        kwargs["configuration"] = configuration
-
+def _valkey_port() -> int:
+    raw_value = os.environ.get(VALKEY_PORT_ENV, str(VALKEY_PORT_DEFAULT)).strip() or str(VALKEY_PORT_DEFAULT)
     try:
-        return CacheClient(default_ttl=timedelta(days=30), **kwargs)
-    except TypeError:
-        return CacheClient(**kwargs)
-
-
-def _momento_put_sorted_set_element(
-    client,
-    cache_name: str,
-    set_name: str,
-    score: str,
-    value: str,
-) -> None:
-    score_float = float(score)
-    call_attempts = (
-        (
-            (),
-            {
-                "cache_name": cache_name,
-                "set_name": set_name,
-                "value": value,
-                "score": score_float,
-            },
-        ),
-        ((cache_name, set_name, value, score_float), {}),
-        ((cache_name, set_name, value, score), {}),
-        (
-            (),
-            {
-                "cache_name": cache_name,
-                "set_name": set_name,
-                "element": value,
-                "score": score_float,
-            },
-        ),
-    )
-
-    last_error: BaseException | None = None
-    for args, kwargs in call_attempts:
-        try:
-            client.sorted_set_put_element(*args, **kwargs)
-            return
-        except (TypeError, AttributeError, ValueError) as exc:  # pragma: no cover - depends on Momento SDK signature
-            last_error = exc
-
-    if last_error is not None:
-        raise last_error
-
-
-def _momento_request_min_interval_seconds() -> float:
-    raw_value = os.environ.get(MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV, "").strip()
-    if not raw_value:
-        return MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_DEFAULT
-
-    try:
-        min_interval = float(raw_value)
+        port = int(raw_value)
     except ValueError as exc:
-        raise RuntimeError(
-            f"Invalid {MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV}: {raw_value}"
-        ) from exc
-
-    if min_interval < 0:
-        raise RuntimeError(f"{MOMENTO_SORTED_SET_MIN_INTERVAL_SECONDS_ENV} must be non-negative")
-
-    return min_interval
+        raise RuntimeError(f"Invalid {VALKEY_PORT_ENV}: {raw_value}") from exc
+    if port <= 0:
+        raise RuntimeError(f"{VALKEY_PORT_ENV} must be greater than zero")
+    return port
 
 
-def _momento_wait_for_request_slot() -> None:
-    min_interval = _momento_request_min_interval_seconds()
-    if min_interval <= 0:
-        return
-
-    now = time.monotonic()
-    last_request_at = float(_RUNTIME_STATE.get("last_momento_request_at", 0.0))
-    elapsed = now - last_request_at if last_request_at else min_interval
-    remaining = min_interval - elapsed
-    if remaining > 0:
-        time.sleep(remaining)
-
-    _RUNTIME_STATE["last_momento_request_at"] = time.monotonic()
-
-
-def _momento_put_sorted_set_elements(
-    client,
-    cache_name: str,
-    set_name: str,
-    elements: dict[str, float],
-) -> None:
-    try:
-        response = client.sorted_set_put_elements(cache_name, set_name, elements)
-    except Exception as exc:
-        if _momento_is_rate_limit_error(exc):
-            raise RuntimeError(
-                f"Momento sorted_set_put_elements failed for cache {cache_name} set {set_name}: {exc}"
-            ) from exc
-        raise
-
-    from momento.responses.data.sorted_set.put_elements import (  # type: ignore[import-not-found]
-        CacheSortedSetPutElements,
-    )
-
-    if isinstance(response, CacheSortedSetPutElements.Error):
-        raise RuntimeError(
-            f"Momento sorted_set_put_elements failed for cache {cache_name} set {set_name}: {response.message}"
-        )
-
-
-def _momento_is_rate_limit_error(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    if "rate limit" in message or "rate-limit" in message:
-        return True
-
-    status_code = getattr(exc, "code", None)
-    if callable(status_code):
-        try:
-            status_code = status_code()
-        except Exception:
-            status_code = None
-
-    status_name = getattr(status_code, "name", "")
-    if str(status_name).upper() == "RESOURCE_EXHAUSTED":
-        return True
-
-    return "resource_exhausted" in message or "resource exhausted" in message
-
-
-def _momento_chunk_sorted_set_elements(elements: dict[str, float]) -> list[dict[str, float]]:
-    chunks: list[dict[str, float]] = []
-    current_chunk: dict[str, float] = {}
-
-    for value, score in elements.items():
-        candidate_chunk = dict(current_chunk)
-        candidate_chunk[value] = score
-        candidate_size = len(
-            json.dumps(candidate_chunk, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        )
-
-        if current_chunk and candidate_size > MOMENTO_SORTED_SET_REQUEST_SIZE_BYTES:
-            chunks.append(current_chunk)
-            current_chunk = {}
-            candidate_chunk = {value: score}
-            candidate_size = len(
-                json.dumps(candidate_chunk, separators=(",", ":"), sort_keys=True).encode("utf-8")
-            )
-
-        current_chunk[value] = score
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-def _momento_is_rate_limit_error(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return "rate limit" in message or "rate-limit" in message
-
-
-def _momento_put_sorted_set_elements_with_retry(
-    client,
-    cache_name: str,
-    set_name: str,
-    elements: dict[str, float],
-) -> None:
-    backoff_seconds = 1.0
-    max_retries = 8
-
-    for chunk in _momento_chunk_sorted_set_elements(elements):
-        for attempt in range(max_retries + 1):
-            try:
-                _momento_wait_for_request_slot()
-                _momento_put_sorted_set_elements(client, cache_name, set_name, chunk)
-                break
-            except RuntimeError as exc:
-                if not _momento_is_rate_limit_error(exc) or attempt == max_retries:
-                    raise
-
-                time.sleep(backoff_seconds)
-                backoff_seconds = min(backoff_seconds * 2, 30.0)
-
-
-def _momento_value_for_output_row(output_type: str, row: dict[str, str]) -> str:
-    payload = {
-        "ip_version": row["ip_version"],
-        "prefix_len": row["prefix_len"],
-        "range_start_hex": row["range_start_hex"],
-        "range_end_hex": row["range_end_hex"],
-        "network": row["network"],
-    }
-
-    if output_type == "asn":
-        payload["asn"] = row["asn"]
-        payload["organization"] = row["organization"]
-    else:
-        payload["country_iso_code"] = row["country_iso_code"]
-        payload["country_name"] = row["country_name"]
-        payload["subdivision"] = row["subdivision"]
-        payload["city"] = row["city"]
-
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
-
-
-def _momento_sorted_set_batch_size() -> int:
-    raw_value = os.environ.get(MOMENTO_SORTED_SET_BATCH_SIZE_ENV, "").strip()
+def _valkey_max_connections() -> int:
+    raw_value = os.environ.get(VALKEY_MAX_CONNECTIONS_ENV, str(VALKEY_MAX_CONNECTIONS_DEFAULT)).strip()
     if not raw_value:
-        return MOMENTO_SORTED_SET_BATCH_SIZE_DEFAULT
-
+        return VALKEY_MAX_CONNECTIONS_DEFAULT
     try:
-        batch_size = int(raw_value)
+        max_connections = int(raw_value)
     except ValueError as exc:
-        raise RuntimeError(f"Invalid {MOMENTO_SORTED_SET_BATCH_SIZE_ENV}: {raw_value}") from exc
-
-    if batch_size <= 0:
-        raise RuntimeError(f"{MOMENTO_SORTED_SET_BATCH_SIZE_ENV} must be greater than zero")
-
-    return batch_size
+        raise RuntimeError(f"Invalid {VALKEY_MAX_CONNECTIONS_ENV}: {raw_value}") from exc
+    if max_connections <= 0:
+        raise RuntimeError(f"{VALKEY_MAX_CONNECTIONS_ENV} must be greater than zero")
+    return max_connections
 
 
-def _momento_cache_name_for_source(source_key: str) -> str:
-    cache_names_raw = os.environ.get(MOMENTO_CACHE_NAMES_BY_SOURCE_ENV, "").strip()
-    if cache_names_raw:
-        try:
-            cache_names = json.loads(cache_names_raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Invalid {MOMENTO_CACHE_NAMES_BY_SOURCE_ENV} JSON"
-            ) from exc
-
-        cache_name = str(cache_names.get(source_key, "")).strip()
-        if cache_name:
-            return cache_name
-
-        raise RuntimeError(f"No Momento cache configured for source {source_key}")
-
-    cache_name = os.environ.get(MOMENTO_CACHE_NAME_ENV, "").strip()
-    if cache_name:
-        return cache_name
-
-    raise RuntimeError("Missing Momento cache configuration")
+def _valkey_tls_enabled() -> bool:
+    raw_value = os.environ.get(VALKEY_TLS_ENV, "true")
+    return _is_truthy(raw_value)
 
 
-def _momento_context(cache_name: str) -> dict[str, Any] | None:
-    secret_name = os.environ.get("MOMENTO_SECRET_NAME", "").strip()
-    secret_key = os.environ.get("MOMENTO_SECRET_KEY", MOMENTO_SECRET_KEY_DEFAULT).strip() or MOMENTO_SECRET_KEY_DEFAULT
-    endpoint_secret_key = (
-        os.environ.get("MOMENTO_ENDPOINT_SECRET_KEY", MOMENTO_ENDPOINT_SECRET_KEY_DEFAULT).strip()
-        or MOMENTO_ENDPOINT_SECRET_KEY_DEFAULT
-    )
-    endpoint_override = os.environ.get("MOMENTO_ENDPOINT", "").strip()
-
-    if not cache_name or not secret_name:
+def _valkey_context() -> dict[str, Any] | None:
+    endpoint = _valkey_endpoint()
+    if not endpoint:
         return None
 
-    token = _momento_token_from_secret(secret_name, secret_key)
-    if not token:
-        return None
+    import redis.asyncio as redis  # type: ignore[import-not-found]
 
-    endpoint = endpoint_override or _momento_endpoint_from_secret(secret_name, endpoint_secret_key)
+    pool_kwargs: dict[str, Any] = {
+        "host": endpoint,
+        "port": _valkey_port(),
+        "decode_responses": True,
+        "max_connections": _valkey_max_connections(),
+        "socket_connect_timeout": 2,
+        "socket_timeout": 2,
+    }
+    if _valkey_tls_enabled():
+        pool_kwargs["connection_class"] = redis.SSLConnection
 
-    client = _momento_cache_client(token, endpoint)
+    pool = redis.ConnectionPool(
+        **pool_kwargs,
+    )
+    client = redis.Redis(connection_pool=pool)
+    valkey_loop = asyncio.new_event_loop()
     return {
-        "cache_name": cache_name,
+        "endpoint": endpoint,
+        "pool": pool,
         "client": client,
+        "loop": valkey_loop,
         "loaded_rows": 0,
         "set_names": set(),
     }
 
 
-def _momento_add_output_row(
-    momento_context: dict[str, Any] | None,
-    output_key: str,
-    output_type: str,
-    row: dict[str, str],
-) -> None:
-    if momento_context is None:
+def _run_valkey_coroutine(valkey_context: dict[str, Any], coroutine):
+    loop = valkey_context.get("loop")
+    if loop is None:
+        return asyncio.run(coroutine)
+    if loop.is_closed():
+        raise RuntimeError("Valkey event loop is closed")
+    return loop.run_until_complete(coroutine)
+
+
+def _close_valkey_context(valkey_context: dict[str, Any] | None) -> None:
+    if valkey_context is None:
         return
-    if output_key not in MOMENTO_SOURCE_OUTPUTS:
+
+    loop = valkey_context.get("loop")
+    if loop is None or loop.is_closed():
         return
 
-    set_name = row["momento_set"]
-    _momento_put_sorted_set_element(
-        momento_context["client"],
-        momento_context["cache_name"],
-        set_name,
-        row["momento_score"],
-        _momento_value_for_output_row(output_type, row),
-    )
-    momento_context["loaded_rows"] += 1
-    momento_context["set_names"].add(set_name)
+    try:
+        loop.run_until_complete(valkey_context["client"].aclose())
+        loop.run_until_complete(valkey_context["pool"].aclose())
+    finally:
+        loop.close()
 
 
-def _momento_add_output_rows(
-    momento_context: dict[str, Any] | None,
-    output_key: str,
+def _valkey_sorted_set_batch_size() -> int:
+    raw_value = os.environ.get(VALKEY_SORTED_SET_BATCH_SIZE_ENV, "").strip()
+    if not raw_value:
+        return VALKEY_SORTED_SET_BATCH_SIZE_DEFAULT
+
+    try:
+        batch_size = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid {VALKEY_SORTED_SET_BATCH_SIZE_ENV}: {raw_value}") from exc
+
+    if batch_size <= 0:
+        raise RuntimeError(f"{VALKEY_SORTED_SET_BATCH_SIZE_ENV} must be greater than zero")
+
+    return batch_size
+
+
+def _valkey_set_name_for_dataset_and_ip_version(dataset: str, ip_version_text: str) -> str:
+    ip_version = str(ip_version_text)
+    if dataset == "asn" and ip_version == "4":
+        return (
+            os.environ.get(VALKEY_ASN_V4_SET_NAME_ENV, VALKEY_ASN_V4_SET_NAME_DEFAULT).strip()
+            or VALKEY_ASN_V4_SET_NAME_DEFAULT
+        )
+    if dataset == "asn" and ip_version == "6":
+        return (
+            os.environ.get(VALKEY_ASN_V6_SET_NAME_ENV, VALKEY_ASN_V6_SET_NAME_DEFAULT).strip()
+            or VALKEY_ASN_V6_SET_NAME_DEFAULT
+        )
+    if dataset == "city" and ip_version == "4":
+        return (
+            os.environ.get(VALKEY_CITY_V4_SET_NAME_ENV, VALKEY_CITY_V4_SET_NAME_DEFAULT).strip()
+            or VALKEY_CITY_V4_SET_NAME_DEFAULT
+        )
+    if dataset == "city" and ip_version == "6":
+        return (
+            os.environ.get(VALKEY_CITY_V6_SET_NAME_ENV, VALKEY_CITY_V6_SET_NAME_DEFAULT).strip()
+            or VALKEY_CITY_V6_SET_NAME_DEFAULT
+        )
+    raise RuntimeError(f"Unsupported dataset/ip_version combination: {dataset}/{ip_version}")
+
+
+def _valkey_last_updated_key(dataset: str) -> str:
+    if dataset == "asn":
+        return (
+            os.environ.get(VALKEY_LAST_UPDATED_ASN_KEY_ENV, VALKEY_LAST_UPDATED_ASN_KEY_DEFAULT).strip()
+            or VALKEY_LAST_UPDATED_ASN_KEY_DEFAULT
+        )
+    if dataset == "city":
+        return (
+            os.environ.get(VALKEY_LAST_UPDATED_CITY_KEY_ENV, VALKEY_LAST_UPDATED_CITY_KEY_DEFAULT).strip()
+            or VALKEY_LAST_UPDATED_CITY_KEY_DEFAULT
+        )
+    raise RuntimeError(f"Unsupported dataset for last-updated key: {dataset}")
+
+
+def _utc_now_iso8601() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _valkey_escape_member_field(value: str) -> str:
+    return value.replace("|", " ").strip()
+
+
+def _valkey_member_for_output_row(output_type: str, row: dict[str, str]) -> str:
+    fields = [str(row["range_end_int"]), output_type, row["network"], row["ip_version"]]
+    if output_type == "asn":
+        fields.extend([row["asn"], row["organization"]])
+    else:
+        fields.extend([
+            row["country_iso_code"],
+            row["country_name"],
+            row["subdivision"],
+            row["city"],
+        ])
+    return "|".join(_valkey_escape_member_field(str(field)) for field in fields)
+
+
+async def _valkey_add_output_rows(
+    valkey_context: dict[str, Any] | None,
     output_type: str,
     rows: list[dict[str, str]],
 ) -> None:
-    del output_key
-    if momento_context is None:
+    if valkey_context is None or not rows:
         return
 
-    batch_by_set: dict[str, dict[str, float]] = {}
+    batch_by_set: dict[str, dict[str, int]] = {}
     for row in rows:
-        set_name = row["momento_set"]
-        elements = batch_by_set.setdefault(set_name, {})
-        elements[_momento_value_for_output_row(output_type, row)] = float(row["momento_score"])
+        set_name = _valkey_set_name_for_dataset_and_ip_version(output_type, row["ip_version"])
+        members = batch_by_set.setdefault(set_name, {})
+        members[_valkey_member_for_output_row(output_type, row)] = int(row["range_start_int"])
 
-    for set_name, elements in batch_by_set.items():
-        _momento_put_sorted_set_elements_with_retry(
-            momento_context["client"],
-            momento_context["cache_name"],
-            set_name,
-            elements,
-        )
-    momento_context["loaded_rows"] += len(rows)
-    for set_name in batch_by_set:
-        momento_context["set_names"].add(set_name)
+    pipeline = valkey_context["client"].pipeline(transaction=False)
+    for set_name, members in batch_by_set.items():
+        pipeline.zadd(set_name, members)
+        valkey_context["set_names"].add(set_name)
+
+    await pipeline.execute()
+    valkey_context["loaded_rows"] += len(rows)
 
 
-def _momento_score_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
-    start_ip = int(parsed_network.network_address)
-
-    # Momento sorted-set scores are numeric and precision-limited, so derive a
-    # compact family-aware score from the network start address.
-    if parsed_network.version == 4:
-        family_bit = 0
-        normalized_start = start_ip << 96
-    else:
-        family_bit = 1
-        normalized_start = start_ip
-
-    prefix = normalized_start >> (128 - 52)
-    return str((family_bit << 52) | prefix)
-
-
-def _momento_score_for_network(network: str) -> str:
-    parsed_network = ipaddress.ip_network(network, strict=False)
-    return _momento_score_for_parsed_network(parsed_network)
-
-
-def _momento_shard_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
-    start_ip = int(parsed_network.network_address)
-    if parsed_network.version == 4:
-        normalized_start = start_ip << 96
-    else:
-        normalized_start = start_ip
-
-    top16 = normalized_start >> (128 - 16)
-    return f"v{parsed_network.version}:{top16:04x}"
-
-
-def _momento_set_for_dataset_and_parsed_network(
+async def _valkey_set_last_updated(
+    valkey_context: dict[str, Any] | None,
     dataset: str,
-    parsed_network: ipaddress._BaseNetwork,
-) -> str:
-    shard = _momento_shard_for_parsed_network(parsed_network)
-    return f"{_momento_set_prefix()}:{dataset}:{shard}"
+) -> None:
+    if valkey_context is None:
+        return
+
+    timestamp = _utc_now_iso8601()
+    key = _valkey_last_updated_key(dataset)
+    await valkey_context["client"].set(key, timestamp)
 
 
-def _momento_sort_key_for_parsed_network(parsed_network: ipaddress._BaseNetwork) -> str:
-    return f"{parsed_network.prefixlen:03d}"
+async def valkey_lookup_member(client, ip_text: str, dataset: str) -> str | None:
+    parsed_ip = ipaddress.ip_address(ip_text)
+    ip_int = int(parsed_ip)
+    set_name = _valkey_set_name_for_dataset_and_ip_version(dataset, str(parsed_ip.version))
+
+    matches = await client.zrangebyscore(
+        set_name,
+        0,
+        ip_int,
+        start=0,
+        num=1,
+        desc=True,
+        withscores=False,
+    )
+    if not matches:
+        return None
+
+    member = str(matches[0])
+    parts = member.split("|")
+    if not parts:
+        return None
+
+    try:
+        end_ip_int = int(parts[0])
+    except ValueError:
+        return None
+
+    if ip_int > end_ip_int:
+        return None
+    return member
 
 
 def _normalized_bounds_for_parsed_network(
     parsed_network: ipaddress._BaseNetwork,
 ) -> tuple[int, int]:
-    start_ip = int(parsed_network.network_address)
-    end_ip = int(parsed_network.broadcast_address)
-    if parsed_network.version == 4:
-        return start_ip << 96, end_ip << 96
-    return start_ip, end_ip
+    return int(parsed_network.network_address), int(parsed_network.broadcast_address)
 
 
-def _momento_range_hex_for_parsed_network(
+def _range_hex_for_parsed_network(
     parsed_network: ipaddress._BaseNetwork,
 ) -> tuple[str, str]:
     normalized_start, normalized_end = _normalized_bounds_for_parsed_network(parsed_network)
     return f"{normalized_start:032x}", f"{normalized_end:032x}"
-
-
-def momento_lookup_fields_for_ip(ip_text: str) -> dict[str, str]:
-    parsed_ip = ipaddress.ip_address(ip_text)
-    ip_int = int(parsed_ip)
-
-    if parsed_ip.version == 4:
-        family_bit = 0
-        normalized_ip = ip_int << 96
-    else:
-        family_bit = 1
-        normalized_ip = ip_int
-
-    prefix = normalized_ip >> (128 - 52)
-    score = str((family_bit << 52) | prefix)
-    top16 = normalized_ip >> (128 - 16)
-    shard = f"v{parsed_ip.version}:{top16:04x}"
-    prefix_len = "32" if parsed_ip.version == 4 else "128"
-    ip_hex = f"{normalized_ip:032x}"
-
-    return {
-        "momento_score": score,
-        "ip_version": str(parsed_ip.version),
-        "shard": shard,
-        "sort_key": f"{int(prefix_len):03d}",
-        "prefix_len": prefix_len,
-        "ip_hex": ip_hex,
-        "asn_momento_set": f"{_momento_set_prefix()}:asn:{shard}",
-        "city_momento_set": f"{_momento_set_prefix()}:city:{shard}",
-    }
-
-
-def momento_lookup_score_for_ip(ip_text: str) -> str:
-    return momento_lookup_fields_for_ip(ip_text)["momento_score"]
 
 
 def _collect_city_geoname_ids(file_path: str) -> set[str]:
@@ -825,6 +534,15 @@ def _download_named_sources(
             file_name,
             os.path.join(directory, file_name),
         )
+
+
+def _cleanup_downloaded_sources(directory: str, file_names: list[str]) -> None:
+    for file_name in file_names:
+        file_path = os.path.join(directory, file_name)
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            continue
 
 
 
@@ -1003,16 +721,19 @@ def _iter_asn_output_rows(asn_path: str):
             )
 
             parsed_network = ipaddress.ip_network(network, strict=False)
-            range_start_hex, range_end_hex = _momento_range_hex_for_parsed_network(parsed_network)
+            range_start_int, range_end_int = _normalized_bounds_for_parsed_network(parsed_network)
+            range_start_hex, range_end_hex = _range_hex_for_parsed_network(parsed_network)
+            set_name = _valkey_set_name_for_dataset_and_ip_version("asn", str(parsed_network.version))
             yield {
-                "momento_score": _momento_score_for_parsed_network(parsed_network),
+                "range_start_int": str(range_start_int),
                 "ip_version": str(parsed_network.version),
-                "shard": _momento_shard_for_parsed_network(parsed_network),
-                "momento_set": _momento_set_for_dataset_and_parsed_network("asn", parsed_network),
-                "sort_key": _momento_sort_key_for_parsed_network(parsed_network),
+                "shard": f"v{parsed_network.version}",
+                "set_name": set_name,
+                "sort_key": f"{parsed_network.prefixlen:03d}",
                 "prefix_len": str(parsed_network.prefixlen),
                 "range_start_hex": range_start_hex,
                 "range_end_hex": range_end_hex,
+                "range_end_int": str(range_end_int),
                 "network": network,
                 "asn": asn_value,
                 "organization": organization_value,
@@ -1053,17 +774,20 @@ def _iter_city_output_rows(city_path: str, locations: dict[str, dict[str, str]])
             geoname_id = geoname_value or registered_value
             location = locations.get(geoname_id, {})
             parsed_network = ipaddress.ip_network(network, strict=False)
-            range_start_hex, range_end_hex = _momento_range_hex_for_parsed_network(parsed_network)
+            range_start_int, range_end_int = _normalized_bounds_for_parsed_network(parsed_network)
+            range_start_hex, range_end_hex = _range_hex_for_parsed_network(parsed_network)
+            set_name = _valkey_set_name_for_dataset_and_ip_version("city", str(parsed_network.version))
 
             yield {
-                "momento_score": _momento_score_for_parsed_network(parsed_network),
+                "range_start_int": str(range_start_int),
                 "ip_version": str(parsed_network.version),
-                "shard": _momento_shard_for_parsed_network(parsed_network),
-                "momento_set": _momento_set_for_dataset_and_parsed_network("city", parsed_network),
-                "sort_key": _momento_sort_key_for_parsed_network(parsed_network),
+                "shard": f"v{parsed_network.version}",
+                "set_name": set_name,
+                "sort_key": f"{parsed_network.prefixlen:03d}",
                 "prefix_len": str(parsed_network.prefixlen),
                 "range_start_hex": range_start_hex,
                 "range_end_hex": range_end_hex,
+                "range_end_int": str(range_end_int),
                 "network": network,
                 "country_iso_code": str(location.get("country_iso_code", "")),
                 "country_name": str(location.get("country_name", "")),
@@ -1077,7 +801,7 @@ def _process_source_job(
     download_bucket_name: str,
     processed_bucket_name: str,
     source_key: str,
-    momento_context: dict[str, Any] | None = None,
+    valkey_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as directory:
         config = SOURCE_OUTPUT_CONFIG[source_key]
@@ -1086,7 +810,7 @@ def _process_source_job(
         output_key = config["output"]
 
         output_rows = 0
-        momento_rows: list[dict[str, str]] = []
+        valkey_rows: list[dict[str, str]] = []
 
         mpu = s3_client.create_multipart_upload(
             Bucket=processed_bucket_name,
@@ -1113,24 +837,37 @@ def _process_source_job(
                 line = "|".join(row[field] for field in output_fields) + "\n"
                 buffer.write(line.encode("utf-8"))
                 output_rows += 1
-                if momento_context is not None and output_key in MOMENTO_SOURCE_OUTPUTS:
-                    momento_rows.append(row)
+                if valkey_context is not None and output_key in VALKEY_SOURCE_OUTPUTS:
+                    valkey_rows.append(row)
 
-                if momento_context is not None and len(momento_rows) >= _momento_sorted_set_batch_size():
-                    _momento_add_output_rows(
-                        momento_context,
-                        output_key,
-                        config["type"],
-                        momento_rows,
+                if valkey_context is not None and len(valkey_rows) >= _valkey_sorted_set_batch_size():
+                    _run_valkey_coroutine(
+                        valkey_context,
+                        _valkey_add_output_rows(
+                            valkey_context,
+                            config["type"],
+                            valkey_rows,
+                        )
                     )
-                    momento_rows = []
+                    valkey_rows = []
 
-            if momento_context is not None and momento_rows:
-                _momento_add_output_rows(
-                    momento_context,
-                    output_key,
-                    config["type"],
-                    momento_rows,
+            if valkey_context is not None and valkey_rows:
+                _run_valkey_coroutine(
+                    valkey_context,
+                    _valkey_add_output_rows(
+                        valkey_context,
+                        config["type"],
+                        valkey_rows,
+                    )
+                )
+
+            if valkey_context is not None and output_rows > 0:
+                _run_valkey_coroutine(
+                    valkey_context,
+                    _valkey_set_last_updated(
+                        valkey_context,
+                        config["type"],
+                    )
                 )
 
             if buffer.tell() >= _S3_MULTIPART_CHUNK_SIZE:
@@ -1182,6 +919,8 @@ def _process_source_job(
                 UploadId=upload_id,
             )
             raise
+        finally:
+            _cleanup_downloaded_sources(directory, dependencies)
 
         _log_event(
             "processed_source_output_summary",
@@ -1219,19 +958,22 @@ def handler(event, context):
     s3_client = _boto3_client("s3")
 
     if source_jobs:
+        valkey_context = _valkey_context()
         processed_jobs = []
-        for source_job in source_jobs:
-            source_key = str(source_job["sourceKey"])
-            momento_context = _momento_context(_momento_cache_name_for_source(source_key))
-            processed_jobs.append(
-                _process_source_job(
-                    s3_client,
-                    download_bucket_name,
-                    processed_bucket_name,
-                    source_key,
-                    momento_context,
+        try:
+            for source_job in source_jobs:
+                source_key = str(source_job["sourceKey"])
+                processed_jobs.append(
+                    _process_source_job(
+                        s3_client,
+                        download_bucket_name,
+                        processed_bucket_name,
+                        source_key,
+                        valkey_context,
+                    )
                 )
-            )
+        finally:
+            _close_valkey_context(valkey_context)
 
         duration_ms = int((time.perf_counter() - started_at) * 1000)
         outputs = sorted(job["output"] for job in processed_jobs)
@@ -1245,20 +987,20 @@ def handler(event, context):
             durationMs=duration_ms,
             mode="worker",
         )
-        if momento_context is None:
+        if valkey_context is None:
             _log_event(
-                "momento_load_skipped",
+                "valkey_load_skipped",
                 requestId=request_id,
-                reason="missing_momento_environment",
+                reason="missing_valkey_environment",
                 outputs=outputs,
             )
         else:
             _log_event(
-                "momento_load_summary",
+                "valkey_load_summary",
                 requestId=request_id,
-                cacheName=momento_context["cache_name"],
-                setCount=len(momento_context["set_names"]),
-                loadedRows=momento_context["loaded_rows"],
+                endpoint=valkey_context["endpoint"],
+                setCount=len(valkey_context["set_names"]),
+                loadedRows=valkey_context["loaded_rows"],
                 outputs=outputs,
             )
 
@@ -1272,9 +1014,9 @@ def handler(event, context):
             "skipReason": "",
             "missingSourceFiles": [],
             "mode": "worker",
-            "momentoLoadedRows": 0 if momento_context is None else momento_context["loaded_rows"],
-            "momentoSetCount": 0 if momento_context is None else len(momento_context["set_names"]),
-            "momentoEnabled": momento_context is not None,
+            "valkeyLoadedRows": 0 if valkey_context is None else valkey_context["loaded_rows"],
+            "valkeySetCount": 0 if valkey_context is None else len(valkey_context["set_names"]),
+            "valkeyEnabled": valkey_context is not None,
         }
 
     if not relevant_records:
