@@ -18,12 +18,20 @@ This project does not use a dedicated release label variable. Releases are isola
 - VALKEY_CITY_V4_SET_NAME
 - VALKEY_CITY_V6_SET_NAME
 
+## Inputs You Need Before Starting
+
+1. Release suffix, for example r20260620.
+2. Four new target set names for ASN and City in both IPv4 and IPv6.
+3. AWS account and region for deployment.
+4. Confirmation that both GeoNetworkStack and GeoProcessStack are healthy.
+
 ## Prerequisites
 
 1. GeoNetworkStack and GeoProcessStack are deployed.
 2. A Valkey serverless cache endpoint exists and is reachable from the process Lambda.
 3. Process Lambda receives VALKEY_ENDPOINT and VALKEY_PORT from deployment.
 4. Valkey authentication secret is not required for this isolated-network deployment model.
+5. Process queue and DLQ are healthy (no sustained DLQ growth before release).
 
 Endpoint source:
 
@@ -47,6 +55,13 @@ Examples:
 
 Pick a release suffix and prepare four new names (ASN/City x IPv4/IPv6).
 
+Example release set:
+
+1. asn_v4_ranges_r20260620
+2. asn_v6_ranges_r20260620
+3. city_v4_ranges_r20260620
+4. city_v6_ranges_r20260620
+
 ## 2. Update Config And Deploy Processor
 
 Update config.py values:
@@ -66,6 +81,10 @@ cdk deploy GeoProcessStack
 
 After deploy, new process runs write to the release-specific sets you configured.
 
+Optional verification:
+
+1. Confirm geolite2-process environment has the expected four VALKEY_*_SET_NAME values.
+
 ## 3. Trigger Processing For Source Files
 
 The process lambda is normally triggered by source file uploads into the download bucket.
@@ -76,6 +95,11 @@ If needed, trigger by uploading updated source files:
 - GeoLite2-ASN-Blocks-IPv6.csv
 - GeoLite2-City-Blocks-IPv4.csv
 - GeoLite2-City-Blocks-IPv6.csv
+
+Operational expectation:
+
+1. One S3 upload should enqueue one process job.
+2. Retries are handled by SQS visibility timeout and DLQ policy.
 
 ## 4. Validate Load Completion
 
@@ -98,6 +122,12 @@ Recommended validation checks:
 1. loadedRows is non-zero.
 2. setCount is 4 for a full ASN+City load.
 3. outputs include the expected processed TXT artifacts.
+4. no sustained batch failures or malformed row parse warnings.
+
+If validation fails:
+
+1. Do not cut over readers.
+2. Fix source/config issue and re-run processing into the same release set names.
 
 ## 5. Cut Over Readers To New Sets
 
@@ -125,6 +155,12 @@ Suggested cutover gates for bulk reader traffic:
 3. p99 latency is 6 seconds or less.
 4. 5xx error rate remains below 0.1%.
 
+Suggested additional gates:
+
+1. Search responses include geolite2-asn.csv and geolite2-city.csv timestamps.
+2. Invalid IP inputs return per-entry errors without failing the full request.
+3. No timeout trend in geo-search CloudWatch metrics after limited canary traffic.
+
 Example:
 
 ```bash
@@ -132,6 +168,10 @@ Example:
 ```
 
 After cutover, lookups read from the new release sets.
+
+Post-cutover check window:
+
+1. Run at least 15 to 30 minutes of production-like traffic observation before retiring old sets.
 
 ## 6. Rollback
 
@@ -145,6 +185,12 @@ Example:
 
 No cache reload is required if previous data is still retained in alternate sets.
 
+Rollback trigger examples:
+
+1. sustained p99 regression above release SLO.
+2. elevated 5xx not explained by upstream dependencies.
+3. data quality issues in ASN or City fields.
+
 ## 7. Retire Old Release Data
 
 After your safety window (for example, 24 to 72 hours), delete old sets.
@@ -154,6 +200,11 @@ Recommended policy:
 1. Keep only Active and Previous releases.
 2. Remove any older release namespaces.
 
+Before deleting old sets:
+
+1. confirm rollback window is closed.
+2. confirm no reader configuration still references old set names.
+
 ## Operational Notes
 
 1. Do not flush the entire cache for normal releases.
@@ -161,3 +212,4 @@ Recommended policy:
 3. Use separate set names for safe bulk reloads and fast rollback.
 4. Keep naming format predictable so operational tooling can identify active and stale releases.
 5. Keep Valkey access inside private isolated subnets and security-group allowlists only.
+6. Keep MAX_IPS_PER_REQUEST conservative until cache latency and Lambda duration data are stable after each release.

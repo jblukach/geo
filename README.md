@@ -1,73 +1,138 @@
 # geo
 
-GeoLite2 download and processing pipeline with Valkey-ready output artifacts.
+AWS CDK project for downloading GeoLite2 source data, transforming it into Valkey-ready range records, and serving low-latency IP lookups from Lambda.
 
-The processor loads GeoLite2 ranges into AWS ElastiCache Serverless for Valkey
-using Redis sorted sets and batched writes.
+## What this repository deploys
 
-## Release Runbook
+This app creates four stack groups:
 
-Use the Valkey runbook for rollout and cutover steps:
+1. GeoStack
+2. GeoNetworkStack
+3. GeoProcessStack
+4. GeoSearchStack
 
-- [docs/valkey-release-runbook.md](docs/valkey-release-runbook.md)
+At a high level:
 
-Release workflow summary:
+1. Download jobs place source CSV files in an S3 download bucket.
+2. S3 object-created events fan into SQS and trigger geolite2-process.
+3. geolite2-process writes processed output artifacts and loads ASN and City ranges into Valkey sorted sets.
+4. geo-search reads from those Valkey sorted sets and returns ASN and geo metadata for one or many IPs.
 
-1. Set release-specific sorted set names in `config.py` (`VALKEY_ASN_V4_SET_NAME`, `VALKEY_ASN_V6_SET_NAME`, `VALKEY_CITY_V4_SET_NAME`, `VALKEY_CITY_V6_SET_NAME`).
-2. Deploy `GeoProcessStack`.
-3. Process source CSV uploads.
-4. Cut over readers to the same four set names.
-5. Keep previous release sets for rollback, then retire old sets.
+## Architecture notes
 
-Process Lambda configuration:
+1. Runtime is Python 3.13 on Lambda arm64.
+2. Network stack uses isolated subnets and an ElastiCache Serverless for Valkey endpoint.
+3. Process and search Lambdas run inside the VPC and share a security-group-to-security-group rule for Valkey port 6379.
+4. Process pipeline uses an SQS queue with DLQ for resilient retries.
+5. Valkey release management is set-name based; there is no release label environment variable.
 
-- `VALKEY_ENDPOINT`: ElastiCache Serverless for Valkey endpoint.
-- `VALKEY_PORT`: cache port. Default: `6379`.
-- `VALKEY_TLS`: enable TLS (`true`/`false`). Default: `true`.
-- `VALKEY_SORTED_SET_BATCH_SIZE`: number of rows buffered before a batched `ZADD`. Default: `5000`.
-- `VALKEY_ASN_V4_SET_NAME`: ASN sorted set for IPv4 ranges. Default: `asn_v4_ranges`.
-- `VALKEY_ASN_V6_SET_NAME`: ASN sorted set for IPv6 ranges. Default: `asn_v6_ranges`.
-- `VALKEY_CITY_V4_SET_NAME`: City sorted set for IPv4 ranges. Default: `city_v4_ranges`.
-- `VALKEY_CITY_V6_SET_NAME`: City sorted set for IPv6 ranges. Default: `city_v6_ranges`.
-- `VALKEY_MAX_CONNECTIONS`: redis connection pool size. Default: `8`.
+## Repository layout
 
-Search Lambda configuration:
+1. geo/: CDK stack definitions.
+2. download/: source download Lambdas.
+3. process/: transform and Valkey load Lambda.
+4. search/: lookup Lambda.
+5. scripts/: operator tools, including load test utility.
+6. docs/: operational runbooks.
+7. tests/: unit tests for process/search and stack wiring.
 
-- `VALKEY_ENDPOINT`: ElastiCache Serverless for Valkey endpoint.
-- `VALKEY_PORT`: cache port. Default: `6379`.
-- `VALKEY_TLS`: enable TLS (`true`/`false`). Default: `true`.
-- `MAX_IPS_PER_REQUEST`: maximum IP values accepted per request. Default: `300`.
-- `MAX_REQUEST_BODY_BYTES`: maximum accepted request body size in bytes. Default: `262144`.
-- `MIN_REMAINING_TIME_MS`: minimum required Lambda budget during processing; requests return `503` when budget is too low. Default: `1500`.
+## Local setup
 
-Bulk search behavior:
+Prerequisites:
 
-1. Supports single-IP and bulk inputs (`ip`, `ips`, query string, or JSON body).
-2. Preserves input order in `results` and returns per-IP errors for invalid values.
-3. Deduplicates valid IP lookups internally to reduce Valkey query load.
-4. Enforces `MAX_IPS_PER_REQUEST` to protect Lambda/Valkey from oversized requests.
-5. Rejects oversized request bodies with `413`.
-6. Returns `503` before timeout if remaining execution budget is too low.
+1. Python 3.13.
+2. Node.js and AWS CDK CLI.
+3. AWS credentials with permissions for CDK deploy.
 
-Timeout and sizing guidance:
+Install dependencies:
 
-1. Search currently performs two Valkey reads per unique valid IP (ASN + City).
-2. Approximate lookup time envelope is `2 * unique_ips * p95_valkey_rtt`.
-3. With `300` unique IPs, rough lookup time is ~0.6s at 1 ms RTT, ~3s at 5 ms RTT, and ~6s at 10 ms RTT.
-4. Keep `MAX_IPS_PER_REQUEST` conservative enough to stay well below API Gateway's 29-second timeout after JSON serialization and network transfer.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-Load testing:
+Run tests:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
+```
+
+Synthesize stacks:
+
+```bash
+cdk synth
+```
+
+Deploy all stacks:
+
+```bash
+cdk deploy --all
+```
+
+Deploy only process/search updates:
+
+```bash
+cdk deploy GeoProcessStack GeoSearchStack
+```
+
+## Key configuration
+
+Source of defaults: config.py
+
+Process Lambda environment:
+
+1. VALKEY_ENDPOINT: required cache endpoint.
+2. VALKEY_PORT: cache port, default 6379.
+3. VALKEY_TLS: true or false, default true.
+4. VALKEY_SORTED_SET_BATCH_SIZE: batched ZADD write size, default 5000.
+5. VALKEY_ASN_V4_SET_NAME: default asn_v4_ranges.
+6. VALKEY_ASN_V6_SET_NAME: default asn_v6_ranges.
+7. VALKEY_CITY_V4_SET_NAME: default city_v4_ranges.
+8. VALKEY_CITY_V6_SET_NAME: default city_v6_ranges.
+9. VALKEY_LAST_UPDATED_ASN_KEY: default geo:last_updated:asn.
+10. VALKEY_LAST_UPDATED_CITY_KEY: default geo:last_updated:city.
+11. VALKEY_MAX_CONNECTIONS: connection pool size, default 8.
+
+Search Lambda environment:
+
+1. VALKEY_ENDPOINT, VALKEY_PORT, VALKEY_TLS.
+2. VALKEY_ASN_V4_SET_NAME, VALKEY_ASN_V6_SET_NAME, VALKEY_CITY_V4_SET_NAME, VALKEY_CITY_V6_SET_NAME.
+3. VALKEY_LAST_UPDATED_ASN_KEY, VALKEY_LAST_UPDATED_CITY_KEY.
+4. MAX_IPS_PER_REQUEST: default 300.
+5. MAX_REQUEST_BODY_BYTES: default 262144.
+6. MIN_REMAINING_TIME_MS: default 1500.
+
+## Search API behavior
+
+Input forms supported:
+
+1. Query parameter ip (single or comma-separated).
+2. JSON body with ip, ips, ipAddress, or query.
+3. Path input patterns under /geo.
+4. GET /geo fallback to caller source IP when explicit IP input is not provided.
+
+Response behavior:
+
+1. Returns status 200 with per-entry results, including per-IP validation errors.
+2. Preserves original input order in results.
+3. Deduplicates valid IP lookups internally to reduce Valkey query volume.
+4. Returns 400 for empty input or oversized IP count.
+5. Returns 413 when request body exceeds MAX_REQUEST_BODY_BYTES.
+6. Returns 503 when Lambda remaining budget is below MIN_REMAINING_TIME_MS.
+
+## Load test utility
 
 ```bash
 python scripts/load_test_search.py \
-	--url https://<api-id>.execute-api.us-east-2.amazonaws.com/geo \
-	--requests 200 \
-	--ips-per-request 300 \
-	--concurrency 20 \
-	--ipv6-ratio 1.0
+  --url https://<api-id>.execute-api.us-east-2.amazonaws.com/geo \
+  --requests 200 \
+  --ips-per-request 300 \
+  --concurrency 20 \
+  --ipv6-ratio 1.0
 ```
 
-Suggested SLO targets for bulk search:
+Suggested service goals:
 
 | Metric | Target |
 | --- | --- |
@@ -76,23 +141,25 @@ Suggested SLO targets for bulk search:
 | p99 latency | <= 6.0s |
 | Error rate (5xx) | < 0.1% |
 
-Additional production hardening recommendations:
+## Security model
 
-1. Configure API Gateway throttling and usage plans to limit abusive callers.
-2. Set Lambda reserved concurrency for `geo-search` to protect Valkey from sudden traffic spikes.
-3. Add CloudWatch alarms on 5xx count, p95 duration, and timeout count.
-4. Track and alert on `search_request_summary` log fields (`durationMs`, `invalidCount`, `requestedCount`, `uniqueValidCount`).
-5. Keep `MAX_IPS_PER_REQUEST` tuned by observed p95/p99 latency, not static defaults.
+1. Process and search run in private isolated subnets.
+2. Valkey allows inbound 6379 only from the Lambda security group.
+3. TLS to Valkey is enabled by default via VALKEY_TLS=true.
+4. Process queue and DLQ enforce SSL.
+5. Valkey authentication token is not used in this isolated-network deployment model.
 
-Valkey auth model:
+## Release operations
 
-- On the isolated VPC deployment model, Valkey access is network-isolated and does not require an auth secret token.
-- Endpoint and port are provided directly by the network stack.
+Use the release runbook for full cutover and rollback procedures:
 
-Security validation checklist:
+1. [docs/valkey-release-runbook.md](docs/valkey-release-runbook.md)
 
-1. `geo-search` and `geolite2-process` run in private isolated subnets.
-2. Valkey security group only allows inbound `6379/tcp` from the Lambda security group.
-3. Lambda-to-Valkey traffic uses TLS (`VALKEY_TLS=true` by default).
-4. SQS queues enforce TLS (`enforce_ssl=True`) and include a DLQ.
-5. No Valkey secret token dependency in process/search runtime.
+Short version:
+
+1. Set new release-specific sorted set names in config.py.
+2. Deploy GeoProcessStack.
+3. Trigger processing by uploading GeoLite2 source files.
+4. Validate load completion in logs.
+5. Deploy readers with matching set names.
+6. Keep previous set names available during rollback window.
