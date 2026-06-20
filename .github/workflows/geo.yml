@@ -1,0 +1,44 @@
+name: geo
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.py"
+      - "requirements.txt"
+      - "cdk.json"
+      - "cdk.context.json"
+      - ".github/workflows/geo.yml"
+  schedule:
+    - cron: '0 2 1 * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: geo-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy CDK
+    runs-on:
+      - codebuild-geo-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+      - uses: aws-actions/configure-aws-credentials@v6.1.2
+        with:
+          role-to-assume: ${{ secrets.ROLE }}
+          aws-region: us-east-2
+          role-session-name: github-actions-geo
+          mask-aws-account-id: true
+      - run: npm install -g aws-cdk
+      - run: npm install -g aws-cdk-lib
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt --upgrade
+      - run: python -m unittest discover -s tests -p "test_*.py"
+      - run: cdk synth
+      - run: cdk deploy --all --require-approval never
