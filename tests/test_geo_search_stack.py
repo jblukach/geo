@@ -42,7 +42,7 @@ class GeoSearchStackTests(unittest.TestCase):
                 "FunctionName": "geo-search",
                 "Runtime": "python3.13",
                 "Handler": "search.handler",
-                "MemorySize": 512,
+                "MemorySize": 1024,
                 "Timeout": 30,
                 "Environment": {
                     "Variables": {
